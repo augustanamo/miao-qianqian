@@ -1,0 +1,284 @@
+import Foundation
+
+// MARK: - 账号模型（对齐 accounts.json）
+struct TraeAuth: Codable, Hashable {
+    var session: String?
+    var token: String?
+    var device_id: String?
+    var uid: String?
+    var saved_at: String?
+}
+
+/// WorkBuddy 账号快照（仅非敏感字段）。
+/// accessToken 等同账号密码，**绝不**写入 accounts.json / 日志 / UI，
+/// 签名时实时从本机登录态文件读取（见 workbuddy.py）。
+struct WorkBuddyAuth: Codable, Hashable {
+    var uid: String?
+    var nickname: String?
+    var uin: String?
+    var domain: String?
+    var enterprise_id: String?
+    var saved_at: String?
+}
+
+struct ReqConf: Codable, Hashable {
+    var method: String?
+    var url: String?
+    var headers: [String: String]?
+    var body: String?
+}
+
+struct Account: Codable, Identifiable, Hashable {
+    var name: String
+    var app: String
+    var type: String?
+    var enabled: Bool?
+    var requests: [ReqConf]?
+    var trae_auth: TraeAuth?
+    var workbuddy_auth: WorkBuddyAuth?
+
+    var id: String { name }
+    var isEnabled: Bool { enabled ?? true }
+    var isTrae: Bool { type == "trae" }
+    var isWorkBuddy: Bool { type == "workbuddy" }
+    var platformLabel: String { app.isEmpty ? "?" : app.uppercased() }
+
+    func maskSession() -> String { Self.mask(trae_auth?.session) }
+    func maskToken() -> String { Self.mask(trae_auth?.token) }
+
+    static func mask(_ v: String?) -> String {
+        guard let v = v, !v.isEmpty else { return "(空)" }
+        if v.count <= 12 { return "******" }
+        return String(v.prefix(8)) + "******"
+    }
+
+    /// 凭证健康：token/session 缺失、无法解析或已过期，一律视为需要重新登录
+    func credentialHint() -> (text: String, color: ColorProxy)? {
+        guard isTrae else { return nil }
+        let token = trae_auth?.token ?? ""
+        let session = trae_auth?.session ?? ""
+        if token.isEmpty {
+            return (text: "Token 为空，请重新登录", color: .red)
+        }
+        if session.isEmpty {
+            return (text: "Session 缺失，请重新登录", color: .red)
+        }
+        guard let exp = Self.jwtExp(token) else { return (text: "凭证无法解析，请重新登录", color: .neutral) }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        if exp < Date() {
+            return (text: "凭证已过期，请重新登录", color: .red)
+        }
+        return (text: "凭证 \(formatter.string(from: exp)) 前有效", color: .green)
+    }
+
+    static func jwtExp(_ jwt: String) -> Date? {
+        let parts = jwt.split(separator: ".")
+        guard parts.count >= 2 else { return nil }
+        var payload = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let padLen = (4 - payload.count % 4) % 4
+        payload += String(repeating: "=", count: padLen)
+        guard let data = Data(base64Encoded: payload),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let exp = obj["exp"] as? Double else { return nil }
+        return Date(timeIntervalSince1970: exp)
+    }
+}
+
+enum ColorProxy { case green, red, neutral }
+
+struct ConfigFile: Codable {
+    var accounts: [Account]?
+}
+
+// MARK: - 日志解析（对齐 checkin.log）
+struct LogHit: Hashable {
+    var time: String
+    var date: String
+    var msg: String
+    var credits: Double
+}
+
+struct ParsedLogs {
+    // date -> name -> hit（当日最后一次）
+    var okByDay: [String: [String: LogHit]] = [:]
+    var failByDay: [String: [String: LogHit]] = [:]
+    var rawLines: [String] = []
+
+    mutating func load(path: String) {
+        okByDay = [:]; failByDay = [:]; rawLines = []
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return }
+        let lines = content.split(separator: "\n")
+        for line in lines {
+            let s = String(line)
+            rawLines.append(s)
+            parseLine(s)
+        }
+    }
+
+    private mutating func parseLine(_ s: String) {
+        // "[2026-09-14 10:36:50] [FAIL] 132(trae) -> msg"
+        // 注意：split("]", maxSplits: 2) 会消费分隔符：
+        //   part0 = "[2026-09-14 10:36:50"
+        //   part1 = " [FAIL"         // 右括号已被消费
+        //   part2 = " 132(trae) -> msg"
+        // 因此 tag 需从 part1 去括号直接取，账号+消息从 part2 提取。
+        guard s.hasPrefix("[") else { return }
+        let partList = s.split(separator: "]", maxSplits: 2)
+        guard partList.count >= 3 else { return }
+        let dateTime = String(partList[0].dropFirst())          // 2026-09-14 10:36:50
+        guard dateTime.count >= 16 else { return }
+        let date = String(dateTime.prefix(10))
+        let tagPart = String(partList[1]).trimmingCharacters(in: .whitespaces)  // "[FAIL"
+        guard tagPart.hasPrefix("[") else { return }
+        let tag = String(tagPart.dropFirst())                   // "FAIL"
+        guard tag == "OK" || tag == "FAIL" || tag == "预览" else { return }
+        var tail = String(partList[2]).trimmingCharacters(in: .whitespaces)
+        guard tail.contains("("), tail.contains(")") else { return }
+        guard let open = tail.firstIndex(of: "("), let close = tail.firstIndex(of: ")"), open < close else { return }
+        let name = String(tail[..<open])
+        let app = String(tail[tail.index(after: open)..<close])
+        tail = String(tail[tail.index(after: close)...]).trimmingCharacters(in: .whitespaces)
+        if tail.hasPrefix("->") { tail = String(tail.dropFirst(2)).trimmingCharacters(in: .whitespaces) }
+        if tag == "预览" { return }
+        let credits = Self.extractCredits(tail)
+        let hit = LogHit(time: String(dateTime.suffix(8)), date: date, msg: tail, credits: credits)
+        if tag == "OK" {
+            okByDay[date, default: [:]][name] = hit
+        } else {
+            failByDay[date, default: [:]][name] = hit
+        }
+    }
+
+    static func extractCredits(_ msg: String) -> Double {
+        // "签到成功，本次获得 0 积分" / "本次获得 128 积分"
+        guard let range = msg.range(of: #"本次获得\s*([\d.]+)"#, options: .regularExpression) else { return 0 }
+        let sub = String(msg[range])
+        let digits = String(sub.filter { $0.isNumber || $0 == "." })
+        return Double(digits) ?? 0
+    }
+
+    func status(name: String, on date: String) -> (state: String, hit: LogHit?) {
+        if let h = okByDay[date]?[name] { return ("done", h) }
+        if let h = failByDay[date]?[name] { return ("fail", h) }
+        return ("pending", nil)
+    }
+
+    func todayOK(_ date: String) -> [String: LogHit] { okByDay[date] ?? [:] }
+    func todayFail(_ date: String) -> [String: LogHit] { failByDay[date] ?? [:] }
+
+    /// 最近一次签到记录（跨天）
+    func lastHit(name: String) -> LogHit? {
+        let dates = Set(okByDay.keys).union(failByDay.keys)
+        for d in dates.sorted(by: >) {
+            if let h = okByDay[d]?[name] { return h }
+            if let h = failByDay[d]?[name] { return h }
+        }
+        return nil
+    }
+
+    /// 每日积分合计（用于柱状图）
+    static func dailyCredits(days: [String], logs: ParsedLogs) -> [Double] {
+        days.map { day in
+            (logs.okByDay[day]?.values.reduce(0) { $0 + $1.credits }) ?? 0
+        }
+    }
+
+    /// 连续签到天数：从 startDate 往前累计 OK 的天数
+    static func streak(for name: String? = nil, logs: ParsedLogs, startDate: String) -> Int {
+        var daysBack = 0
+        var count = 0
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        guard let start = formatter.date(from: startDate) else { return 0 }
+        var cur = start
+        while true {
+            let d = formatter.string(from: cur)
+            if let name = name {
+                if logs.okByDay[d]?[name] != nil { count += 1 } else { break }
+            } else {
+                if let ok = logs.okByDay[d], !ok.isEmpty { count += 1 } else { break }
+            }
+            guard let prev = Calendar.current.date(byAdding: .day, value: -1, to: cur) else { break }
+            cur = prev
+            daysBack += 1
+            if daysBack > 366 { break }
+        }
+        return count
+    }
+}
+
+// MARK: - 应用偏好（native_prefs.json）
+struct AppPrefs: Codable {
+    var autoSignOnLaunch: Bool = false
+    var retryOnFail: Bool = true
+    var notifyOnComplete: Bool = false
+    var creditsRefreshMinutes: Int = 30
+    var staggerMinutes: Int = 0
+    var times: [[Int]] = [[21, 30]]
+    var weekdays: [Int] = [1, 2, 3, 4, 5, 6, 7] // 1=周一 ... 7=周日
+
+    static var path: String { AppPaths.projectDir + "/native_prefs.json" }
+
+    static func load() -> AppPrefs {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let p = try? JSONDecoder().decode(AppPrefs.self, from: data) else {
+            return AppPrefs()
+        }
+        return p
+    }
+    func save() {
+        guard let data = try? JSONEncoder().encode(self) else { return }
+        try? data.write(to: URL(fileURLWithPath: Self.path), options: .atomic)
+    }
+}
+
+// MARK: - 路径探测
+enum AppPaths {
+    static let toolName = "auto-checkin"
+
+    static var projectDir: String {
+        // 1) 运行在 .app 包内：bundle 位于 ~/auto-checkin/AutoCheck.app
+        let bundle = Bundle.main.bundlePath
+        if bundle.hasSuffix(".app") {
+            return (bundle as NSString).deletingLastPathComponent
+        }
+        // 2) 环境变量覆盖（swift run / 命令行测试）
+        if let env = ProcessInfo.processInfo.environment["AUTOCHECKIN_DIR"], !env.isEmpty {
+            return env
+        }
+        // 3) 从可执行文件路径向上找存储根
+        return (Bundle.main.executablePath as NSString?)?.deletingLastPathComponent ?? ""
+    }
+
+    static var accountsFile: String { projectDir + "/accounts.json" }
+    static var logFile: String { projectDir + "/logs/checkin.log" }
+    static var launchdLog: String { projectDir + "/logs/launchd.log" }
+    static var launchdErr: String { projectDir + "/logs/launchd.err.log" }
+    static var curDir: String { FileManager.default.currentDirectoryPath }
+}
+
+// MARK: - 日期工具
+enum DayTool {
+    static let formatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+    static func today() -> String { formatter.string(from: Date()) }
+
+    static func lastDays(_ n: Int) -> [String] {
+        var out: [String] = []
+        for i in (0..<n).reversed() {
+            guard let d = Calendar.current.date(byAdding: .day, value: -i, to: Date()) else { continue }
+            out.append(formatter.string(from: d))
+        }
+        return out
+    }
+    static func weekCredits(logs: ParsedLogs) -> Double {
+        let days = lastDays(7)
+        return ParsedLogs.dailyCredits(days: days, logs: logs).reduce(0, +)
+    }
+}
