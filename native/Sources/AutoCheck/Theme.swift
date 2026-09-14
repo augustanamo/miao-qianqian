@@ -1,23 +1,52 @@
 import SwiftUI
+import AppKit
 
-// MARK: - 设计稿配色
+// MARK: - 设计稿令牌
+// 取值全部来自 4 张设计稿的像素采样（1440×900 画布）
 enum Theme {
-    static let sidebar     = Color(red: 13/255,  green: 13/255,  blue: 13/255)   // #0D0D0D 深黑侧边栏
-    static let sidebarCard = Color(red: 26/255,  green: 26/255,  blue: 26/255)   // #1A1A1A 侧边栏卡片
-    static let darkCard    = Color(red: 16/255,  green: 16/255,  blue: 16/255)   // 深色签到卡片
-    static let sidebarMuted = Color(red: 160/255, green: 160/255, blue: 160/255)
-    static let primary     = Color(red: 0/255,   green: 102/255, blue: 255/255)  // #0066FF 主蓝
-    static let action      = Color(red: 0/255,   green: 0/255,   blue: 0/255)    // #000000 主操作按钮纯黑
-    static let success     = Color(red: 52/255,  green: 199/255, blue: 89/255)   // #34C759 成功绿
-    static let danger      = Color(red: 229/255, green: 57/255,  blue: 53/255)   // #E53935 暗砖红
-    static let warning     = Color(red: 255/255, green: 149/255, blue: 0/255)
-    static let textMain    = Color(red: 232/255, green: 232/255, blue: 232/255)
-    static let textDeep    = Color(red: 30/255,  green: 30/255,  blue: 34/255)
-    static let textMuted   = Color(red: 102/255, green: 102/255, blue: 102/255)  // #666
-    static let mainBg      = Color(red: 245/255, green: 246/255, blue: 248/255)
-    static let grayBar     = Color(red: 201/255, green: 201/255, blue: 201/255)
-    static let cardBorder  = Color.black.opacity(0.08)
-    static let corner: CGFloat = 8
+    // 画布
+    static let pageBG     = Color.white                              // 主内容区：纯白
+    static let border     = Color(hex: 0xE2E2E2)                     // 卡片 1px 描边
+    static let hairline   = Color(hex: 0xEFEFEF)                     // 卡内分隔线
+    static let chipBG     = Color(hex: 0xF5F5F5)                     // 灰底胶囊 / 输入框
+    static let track      = Color(hex: 0xE5E5E5)                     // 进度槽 / 灰柱
+
+    // 侧边栏 / 深色面
+    static let sidebar      = Color(hex: 0x0A0A0A)
+    static let sidebarCard  = Color(hex: 0x1A1A1A)                   // 选中项 / 进度卡
+    static let sidebarTrack = Color(hex: 0x2A2A2A)
+    static let sidebarLabel = Color(hex: 0x6E6E6E)                   // 「导航」小标题
+    static let sidebarDim   = Color(hex: 0x5C5C5C)                   // 未选中编号
+    static let sidebarText  = Color(hex: 0x787878)                   // 未选中文字/图标
+    static let sidebarIcon  = Color(hex: 0xC6C6C6)                   // 选中项图标
+    static let darkCaption  = Color(hex: 0x8A8A8A)                   // 深色卡内的灰字
+
+    // 语义色
+    static let accent      = Color(hex: 0xFF3B30)                    // 主红：今日柱 / 失败 / 编号
+    static let accentSoft  = Color(hex: 0xFFECEB)
+    static let success     = Color(hex: 0x22C55E)
+    static let successSoft = Color(hex: 0xE8F8EF)
+    static let warn        = Color(hex: 0xE8873A)
+    static let warnSoft    = Color(hex: 0xFDF4E6)
+    static let neutral     = Color(hex: 0xBBBBBB)
+
+    // 文本
+    static let text       = Color(hex: 0x0A0A0A)
+    static let textBody   = Color(hex: 0x333333)
+    static let textSub    = Color(hex: 0x999999)
+    static let textFaint  = Color(hex: 0xB4B4B4)
+    static let inputText  = Color(hex: 0x0A0A0A)   // App 已强制浅色外观，输入框文字恒为深色
+
+    // 几何
+    static let cardCorner: CGFloat = 12
+    static let ctrlCorner: CGFloat = 8
+    static let chipCorner: CGFloat = 8
+    static let topBarHeight: CGFloat = 52
+    static let statusBarHeight: CGFloat = 32
+    static let sidebarWidth: CGFloat = 240
+    static let pagePadding: CGFloat = 38
+
+    static let version = "v2.4.1"
 }
 
 extension Color {
@@ -30,110 +59,318 @@ extension Color {
     }
 }
 
-// MARK: - 通用卡片 / 按钮 / 文案组件
-struct Card<Content: View>: View {
-    var padding: CGFloat = 16
-    var color: Color = .white
-    @ViewBuilder var content: Content
-    var body: some View {
-        content
-            .padding(padding)
-            .background(color)
-            .cornerRadius(Theme.corner)
-            .overlay(RoundedRectangle(cornerRadius: Theme.corner).stroke(Theme.cardBorder, lineWidth: 1))
-            .shadow(color: .black.opacity(0.08), radius: 10, y: 3)
+// MARK: - 平台真实图标
+/// 加载平台 App 的真实图标（从本机已安装的 Trae / WorkBuddy 提取，见 assets/platform-icons/）。
+/// 打包后位于 `Contents/Resources/<name>.png`，由 main bundle 命中；
+/// `swift run` 开发期回退到工程 assets 目录。取不到时调用方回退为首字方块。
+enum PlatformIcon {
+    private static let cache = NSCache<NSString, NSImage>()
+
+    static func image(_ name: String?) -> NSImage? {
+        guard let name = name, !name.isEmpty else { return nil }
+        if let hit = cache.object(forKey: name as NSString) { return hit }
+        var img = NSImage(named: name)
+        if img == nil {
+            img = NSImage(contentsOfFile: AppPaths.projectDir + "/assets/platform-icons/\(name).png")
+        }
+        guard let image = img else { return nil }
+        image.isTemplate = false
+        cache.setObject(image, forKey: name as NSString)
+        return image
     }
 }
 
-struct CardHeader: View {
+// MARK: - 卡片
+struct Card<Content: View>: View {
+    var padding: CGFloat? = 18
+    var color: Color = .white
+    var radius: CGFloat = Theme.cardCorner
+    var bordered: Bool = true
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        Group {
+            if let padding = padding {
+                content.padding(padding)
+            } else {
+                content
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(color)
+        .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: radius, style: .continuous)
+                .stroke(bordered ? Theme.border : Color.clear, lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.04), radius: 3, x: 0, y: 1)
+    }
+}
+
+/// 卡片标题行：左标题（16 semibold）+ 可选右侧内容
+struct CardTitle<Trailing: View>: View {
     let title: String
-    var subtitle: String? = nil
-    var trailing: AnyView? = nil
-    init(_ title: String, subtitle: String? = nil, @ViewBuilder trailing: () -> AnyView = { AnyView(EmptyView()) }) {
+    /// 标题右侧紧跟的灰色补充（如「6 个账号」胶囊由外部传入时留空）
+    @ViewBuilder var trailing: Trailing
+    init(_ title: String, @ViewBuilder trailing: () -> Trailing = { EmptyView() }) {
         self.title = title
-        self.subtitle = subtitle
         self.trailing = trailing()
     }
     var body: some View {
         HStack(spacing: 8) {
-            Text(title).font(.system(size: 14, weight: .semibold)).foregroundColor(Theme.textDeep)
-            if let subtitle = subtitle {
-                Text(subtitle).font(.system(size: 12)).foregroundColor(Theme.textMuted)
-            }
+            Text(title)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundColor(Theme.text)
             Spacer(minLength: 8)
-            if let trailing = trailing { trailing }
+            trailing
         }
     }
 }
 
-struct PrimaryButtonStyle: ButtonStyle {
-    var bg: Color = Theme.action
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 13, weight: .semibold))
-            .foregroundColor(.white)
-            .padding(.horizontal, 14).padding(.vertical, 7)
-            .background(configuration.isPressed ? bg.opacity(0.8) : bg)
-            .cornerRadius(6)
-    }
-}
-
-struct GhostButtonStyle: ButtonStyle {
-    var color: Color = Theme.textDeep
-    var bg: Color = .white
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(size: 13, weight: .medium))
-            .foregroundColor(color)
-            .padding(.horizontal, 14).padding(.vertical, 7)
-            .background(bg)
-            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Theme.cardBorder, lineWidth: 1))
-            .cornerRadius(6)
-            .opacity(configuration.isPressed ? 0.7 : 1)
-    }
-}
-
-struct StatusDot: View {
-    let color: Color
-    var size: CGFloat = 8
-    var body: some View {
-        Circle().fill(color).frame(width: size, height: size)
-    }
-}
-
-struct Pill: View {
-    let text: String
-    let fg: Color
-    let bg: Color
-    var body: some View {
-        Text(text)
-            .font(.system(size: 11, weight: .medium))
-            .foregroundColor(fg)
-            .padding(.horizontal, 8).padding(.vertical, 3)
-            .background(bg)
-            .cornerRadius(5)
-    }
-}
-
-struct PageHeader: View {
+// MARK: - 页头
+struct PageHeader<Trailing: View>: View {
     let title: String
     var subtitle: String? = nil
-    @ViewBuilder var trailing: AnyView
-    init(_ title: String, subtitle: String? = nil, @ViewBuilder trailing: () -> AnyView = { AnyView(EmptyView()) }) {
+    @ViewBuilder var trailing: Trailing
+    init(_ title: String, subtitle: String? = nil, @ViewBuilder trailing: () -> Trailing = { EmptyView() }) {
         self.title = title
         self.subtitle = subtitle
         self.trailing = trailing()
     }
     var body: some View {
-        HStack(alignment: .center, spacing: 8) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.system(size: 28, weight: .bold)).foregroundColor(Theme.textDeep)
-                if let subtitle = subtitle {
-                    Text(subtitle).font(.system(size: 13)).foregroundColor(Theme.textMuted)
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(title)
+                    .font(.system(size: 30, weight: .bold))
+                    .foregroundColor(Theme.text)
+                if let subtitle = subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.system(size: 13))
+                        .foregroundColor(Theme.textSub)
                 }
             }
-            Spacer()
-            trailing
+            Spacer(minLength: 12)
+            HStack(spacing: 10) { trailing }
         }
     }
+}
+
+// MARK: - 按钮
+struct PrimaryButtonStyle: ButtonStyle {
+    var bg: Color = .black
+    @Environment(\.isEnabled) private var isEnabled
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundColor(.white)
+            .padding(.horizontal, 14)
+            .frame(height: 34)
+            .background(isEnabled ? (configuration.isPressed ? bg.opacity(0.82) : bg) : Color(hex: 0xBFBFBF))
+            .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .contentShape(Rectangle())
+    }
+}
+
+struct GhostButtonStyle: ButtonStyle {
+    var fg: Color = Theme.text
+    @Environment(\.isEnabled) private var isEnabled
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 13, weight: .medium))
+            .foregroundColor(isEnabled ? fg : Theme.textFaint)
+            .padding(.horizontal, 14)
+            .frame(height: 34)
+            .background(Color.white)
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .stroke(Theme.border, lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .opacity(configuration.isPressed ? 0.72 : 1)
+            .contentShape(Rectangle())
+    }
+}
+
+/// 胶囊小按钮（时间片 / 星期 / 分类）
+struct ChipButtonStyle: ButtonStyle {
+    var selected: Bool = false
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12.5, weight: selected ? .semibold : .regular))
+            .foregroundColor(selected ? .white : Theme.textBody)
+            .padding(.horizontal, 12)
+            .frame(height: 30)
+            .background(selected ? Color.black : Theme.chipBG)
+            .clipShape(RoundedRectangle(cornerRadius: Theme.chipCorner, style: .continuous))
+            .opacity(configuration.isPressed ? 0.8 : 1)
+            .contentShape(Rectangle())
+    }
+}
+
+// MARK: - 分段控件（黑胶囊选中态）
+struct SegmentedControl<T: Hashable>: View {
+    struct Item: Identifiable {
+        let id: T
+        let title: String
+        var badge: String? = nil
+        init(_ id: T, _ title: String, badge: String? = nil) {
+            self.id = id; self.title = title; self.badge = badge
+        }
+    }
+    let items: [Item]
+    @Binding var selection: T
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(items) { item in
+                let on = item.id == selection
+                Button {
+                    selection = item.id
+                } label: {
+                    HStack(spacing: 5) {
+                        Text(item.title)
+                            .font(.system(size: 12.5, weight: on ? .semibold : .regular))
+                        if let badge = item.badge {
+                            Text(badge).font(.system(size: 12, weight: on ? .semibold : .regular)).opacity(0.75)
+                        }
+                    }
+                    .foregroundColor(on ? .white : Color(hex: 0x5C5C5C))
+                    .padding(.horizontal, 12)
+                    .frame(height: 26)
+                    .background(on ? Color.black : Color.clear)
+                    .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(2)
+        .background(Theme.chipBG)
+        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+    }
+}
+
+// MARK: - 小部件
+struct Dot: View {
+    let color: Color
+    var size: CGFloat = 8
+    var body: some View { Circle().fill(color).frame(width: size, height: size) }
+}
+
+/// 灰底胶囊（「6 个账号」「今天」等）
+struct SoftTag: View {
+    let text: String
+    var fg: Color = Color(hex: 0x8A8A8A)
+    var bg: Color = Theme.chipBG
+    var body: some View {
+        Text(text)
+            .font(.system(size: 11.5, weight: .medium))
+            .foregroundColor(fg)
+            .padding(.horizontal, 8)
+            .frame(height: 20)
+            .background(bg)
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+    }
+}
+
+/// 状态胶囊：圆点 + 文案（已完成 / 签到失败 / 待签到 / 已停用）
+struct StatusPill: View {
+    let text: String
+    let color: Color
+    var bg: Color
+    var body: some View {
+        HStack(spacing: 5) {
+            Dot(color: color, size: 6)
+            Text(text).font(.system(size: 12, weight: .medium)).foregroundColor(color)
+        }
+        .padding(.horizontal, 9)
+        .frame(height: 24)
+        .background(bg)
+        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+    }
+}
+
+/// 细进度条
+struct ProgressBar: View {
+    var value: Double            // 0...1
+    var height: CGFloat = 8
+    var fill: Color = Theme.success
+    var track: Color = Theme.track
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(track)
+                Capsule().fill(fill)
+                    .frame(width: max(0, min(1, value)) * geo.size.width)
+            }
+        }
+        .frame(height: height)
+    }
+}
+
+/// 表单字段标签 + 容器
+struct FieldBox<Content: View>: View {
+    @ViewBuilder var content: Content
+    var body: some View {
+        content
+            .padding(.horizontal, 12)
+            .frame(height: 40)
+            .background(Color.white)
+            .clipShape(RoundedRectangle(cornerRadius: Theme.ctrlCorner, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: Theme.ctrlCorner, style: .continuous)
+                    .stroke(Theme.border, lineWidth: 1)
+            )
+    }
+}
+
+struct FormLabel: View {
+    let text: String
+    var body: some View {
+        Text(text).font(.system(size: 12.5)).foregroundColor(Theme.textSub)
+    }
+}
+
+/// 下拉选择（照设计稿：白底 + 描边 + 右侧 chevron）
+struct SelectBox<Content: View>: View {
+    @ViewBuilder var content: Content
+    var body: some View {
+        HStack(spacing: 6) {
+            content
+            Image(systemName: "chevron.down")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(Theme.textSub)
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 32)
+        .background(Color.white)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.ctrlCorner, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.ctrlCorner, style: .continuous)
+                .stroke(Theme.border, lineWidth: 1)
+        )
+    }
+}
+
+/// 绿色开关（描边兜底，避免关闭态在浅色底上看不见）
+struct GreenSwitch: View {
+    @Binding var isOn: Bool
+    var body: some View {
+        Toggle("", isOn: $isOn)
+            .toggleStyle(.switch)
+            .tint(Theme.success)
+            .labelsHidden()
+            .overlay(
+                Capsule().stroke(isOn ? Color.clear : Color(hex: 0xCFCFCF), lineWidth: 1)
+            )
+    }
+}
+
+/// 顶栏拖拽区：让自绘顶栏的空白处仍可拖动窗口
+/// （.windowStyle(.hiddenTitleBar) 后系统不再提供标题栏拖拽区域）
+struct WindowDragArea: NSViewRepresentable {
+    final class DragView: NSView {
+        override var mouseDownCanMoveWindow: Bool { true }
+    }
+    func makeNSView(context: Context) -> NSView { DragView() }
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }

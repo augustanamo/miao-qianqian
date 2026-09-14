@@ -43,6 +43,17 @@ struct Account: Codable, Identifiable, Hashable {
     var isWorkBuddy: Bool { type == "workbuddy" }
     var platformLabel: String { app.isEmpty ? "?" : app.uppercased() }
 
+    /// 平台图标资源名（对应 assets/platform-icons/<name>.png）。
+    /// 取不到真实图标时返回 nil，UI 回退为首字方块头像。
+    var platformIconName: String? {
+        if isTrae { return "trae" }
+        if isWorkBuddy { return "workbuddy" }
+        let a = app.lowercased()
+        if a.contains("trae") { return "trae" }
+        if a.contains("workbuddy") { return "workbuddy" }
+        return nil
+    }
+
     func maskSession() -> String { Self.mask(trae_auth?.session) }
     func maskToken() -> String { Self.mask(trae_auth?.token) }
 
@@ -84,6 +95,23 @@ struct Account: Codable, Identifiable, Hashable {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let exp = obj["exp"] as? Double else { return nil }
         return Date(timeIntervalSince1970: exp)
+    }
+}
+
+extension Account {
+    /// 表格副标题用的凭据摘要（只暴露脱敏摘要，不含任何完整凭据）
+    func credentialSummary() -> String {
+        if isWorkBuddy {
+            let n = workbuddy_auth?.nickname ?? ""
+            return n.isEmpty ? "本机登录态" : n
+        }
+        if isTrae {
+            let token = trae_auth?.token ?? ""
+            if token.isEmpty { return "Token 未配置" }
+            if let exp = Self.jwtExp(token), exp < Date() { return "Token 已过期" }
+            return "Token \(Self.mask(token))"
+        }
+        return "Cookie 已配置"
     }
 }
 
@@ -161,8 +189,15 @@ struct ParsedLogs {
     }
 
     func status(name: String, on date: String) -> (state: String, hit: LogHit?) {
-        if let h = okByDay[date]?[name] { return ("done", h) }
-        if let h = failByDay[date]?[name] { return ("fail", h) }
+        // 先精确匹配；未命中时兼容「日志名是账号名前缀」的写法
+        // （日志里写 132(trae)，accounts.json 里账号名为 132trae 的历史数据场景），
+        // 避免账号被误判为"未签到/空"。
+        let oks = okByDay[date] ?? [:]
+        let fails = failByDay[date] ?? [:]
+        if let h = oks[name] { return ("done", h) }
+        if let h = fails[name] { return ("fail", h) }
+        for (k, h) in oks where k.count >= 2 && name.hasPrefix(k) { return ("done", h) }
+        for (k, h) in fails where k.count >= 2 && name.hasPrefix(k) { return ("fail", h) }
         return ("pending", nil)
     }
 
@@ -215,12 +250,31 @@ struct AppPrefs: Codable {
     var autoSignOnLaunch: Bool = false
     var retryOnFail: Bool = true
     var notifyOnComplete: Bool = false
+    var dailyDigestReminder: Bool = false
+    var syncHistoryCreditsOnLogin: Bool = true
     var creditsRefreshMinutes: Int = 30
     var staggerMinutes: Int = 0
     var times: [[Int]] = [[21, 30]]
     var weekdays: [Int] = [1, 2, 3, 4, 5, 6, 7] // 1=周一 ... 7=周日
 
     static var path: String { AppPaths.projectDir + "/native_prefs.json" }
+
+    init() {}
+
+    /// 逐字段兜底解码：老版本 native_prefs.json 缺少新增字段时不会整份重置
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = AppPrefs()
+        autoSignOnLaunch = (try? c.decode(Bool.self, forKey: .autoSignOnLaunch)) ?? d.autoSignOnLaunch
+        retryOnFail = (try? c.decode(Bool.self, forKey: .retryOnFail)) ?? d.retryOnFail
+        notifyOnComplete = (try? c.decode(Bool.self, forKey: .notifyOnComplete)) ?? d.notifyOnComplete
+        dailyDigestReminder = (try? c.decode(Bool.self, forKey: .dailyDigestReminder)) ?? d.dailyDigestReminder
+        syncHistoryCreditsOnLogin = (try? c.decode(Bool.self, forKey: .syncHistoryCreditsOnLogin)) ?? d.syncHistoryCreditsOnLogin
+        creditsRefreshMinutes = (try? c.decode(Int.self, forKey: .creditsRefreshMinutes)) ?? d.creditsRefreshMinutes
+        staggerMinutes = (try? c.decode(Int.self, forKey: .staggerMinutes)) ?? d.staggerMinutes
+        times = (try? c.decode([[Int]].self, forKey: .times)) ?? d.times
+        weekdays = (try? c.decode([Int].self, forKey: .weekdays)) ?? d.weekdays
+    }
 
     static func load() -> AppPrefs {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),

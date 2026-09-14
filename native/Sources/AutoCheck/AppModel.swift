@@ -108,14 +108,26 @@ final class AppModel: ObservableObject {
 
     func todaySummary() -> (done: Int, fail: Int, pending: Int, credit: Double, total: Int) {
         let today = DayTool.today()
-        let oks = parsed.todayOK(today)
-        let fails = parsed.todayFail(today)
+        // 以「启用账号」为口径汇总，避免把已删除/未启用账号的日志计入；
+        // 通过 parsed.status 的前缀兼容匹配，确保日志名与账号名存在差异时也能正确归类（如"132" vs "132trae"）。
+        let en = enabledAccounts()
+        var doneCount = 0
+        var failCount = 0
+        var pendingCount = 0
         var credit = 0.0
-        for (_, h) in oks { credit += h.credits }
-        let pending = enabledAccounts().filter { acc in
-            oks[acc.name] == nil && fails[acc.name] == nil
-        }.count
-        return (oks.count, fails.count, pending, credit, enabledAccounts().count)
+        for acc in en {
+            let st = parsed.status(name: acc.name, on: today)
+            switch st.state {
+            case "done":
+                doneCount += 1
+                if let h = st.hit { credit += h.credits }
+            case "fail":
+                failCount += 1
+            default:
+                pendingCount += 1
+            }
+        }
+        return (doneCount, failCount, pendingCount, credit, en.count)
     }
 
     func accStatus(_ name: String) -> (state: String, hit: LogHit?) {
@@ -145,8 +157,9 @@ final class AppModel: ObservableObject {
 
     func greenText() -> String {
         let oks = parsed.todayOK(DayTool.today())
-        guard !oks.isEmpty else { return "" }
-        return "今日 \(oks.keys.sorted().joined(separator: "、")) 签到成功"
+        let names = oks.keys.sorted()
+        guard !names.isEmpty else { return "" }
+        return "\(names.joined(separator: "、"))签到成功"
     }
 
     func countdown() -> String {
@@ -154,6 +167,21 @@ final class AppModel: ObservableObject {
         let sec = Int(max(0, next.timeIntervalSinceNow))
         if sec > 3600 { return "\(sec / 3600) 小时 \((sec % 3600) / 60) 分" }
         return "\(max(0, sec / 60)) 分 \(sec % 60) 秒"
+    }
+
+    /// 最近一次成功/失败签到的时刻（今天优先，跨天回退到最近一天）
+    func lastSyncTime() -> String? {
+        let today = DayTool.today()
+        var times = parsed.todayOK(today).values.map { $0.time }
+        times += parsed.todayFail(today).values.map { $0.time }
+        if times.isEmpty {
+            let dates = Set(parsed.okByDay.keys).union(parsed.failByDay.keys).sorted(by: >)
+            guard let d = dates.first else { return nil }
+            var t = parsed.okByDay[d]?.values.map { $0.time } ?? []
+            t += parsed.failByDay[d]?.values.map { $0.time } ?? []
+            return t.sorted().last
+        }
+        return times.sorted().last
     }
 
     // MARK: 签到（按启用的账号 --only，尊重 enabled，不依赖后端改动）
@@ -294,8 +322,11 @@ final class AppModel: ObservableObject {
 
     private func doubleAfter(_ s: String, _ key: String) -> Double? {
         guard let r = s.range(of: key) else { return nil }
+        // key 后可能先跟空格/全角逗号等分隔符再出现数字（如"总限额 4650，已用 2142.69"），
+        // 必须先跳过分隔符再取数字，否则 prefix 立即因首字符不是数字而返回空。
         let rest = String(s[r.upperBound...])
-        let digits = rest.prefix { $0.isNumber || $0 == "." }
+        let trimmed = rest.drop(while: { $0.isWhitespace || $0 == "，" || $0 == "," })
+        let digits = trimmed.prefix { $0.isNumber || $0 == "." }
         guard !digits.isEmpty else { return nil }
         return Double(String(digits))
     }
@@ -386,6 +417,8 @@ final class AppModel: ObservableObject {
             if code == 0 {
                 self?.loadAccounts()
                 self?.showToast("登录完成，账号已保存", .success)
+                // 设置页「登录时同步历史积分」：登录成功后顺带拉一次积分
+                if self?.pref.syncHistoryCreditsOnLogin == true { self?.refreshCredits() }
             } else {
                 self?.showToast("登录未完成或已取消", .error)
             }
@@ -590,6 +623,42 @@ final class AppModel: ObservableObject {
             let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
             center.add(req)
         }
+    }
+
+    // MARK: 每日汇总提醒（设置页「每日汇总提醒」开关）
+    private static let digestID = "com.marvis.autocheck.daily-digest"
+
+    /// 在当天最后一个签到时间点之后半小时提醒，内容为当前仍未签到的账号。
+    func scheduleDailyDigest() {
+        let center = UNUserNotificationCenter.current()
+        let last = (pref.times.isEmpty ? [[21, 30]] : pref.times).max { ($0[0], $0[1]) < ($1[0], $1[1]) } ?? [21, 30]
+        var comp = DateComponents()
+        comp.hour = (last[0] + 1) % 24
+        comp.minute = last[1]
+        let content = UNMutableNotificationContent()
+        content.title = "今日签到汇总"
+        content.body = dailyDigestBody()
+        content.sound = .default
+        let trigger = UNCalendarNotificationTrigger(dateMatching: comp, repeats: true)
+        center.requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
+            guard granted else { return }
+            center.removePendingNotificationRequests(withIdentifiers: [Self.digestID])
+            center.add(UNNotificationRequest(identifier: Self.digestID, content: content, trigger: trigger))
+            DispatchQueue.main.async { self?.showToast("每日汇总提醒已开启", .success) }
+        }
+    }
+
+    func cancelDailyDigest() {
+        UNUserNotificationCenter.current()
+            .removePendingNotificationRequests(withIdentifiers: [Self.digestID])
+    }
+
+    private func dailyDigestBody() -> String {
+        let pending = accounts.filter { $0.isEnabled && accStatus($0.name).state != "done" }
+        if pending.isEmpty { return "今日所有启用账号均已签到完成" }
+        let names = pending.prefix(4).map { $0.name }.joined(separator: "、")
+        let tail = pending.count > 4 ? " 等" : ""
+        return "还有 \(pending.count) 个账号未签到：\(names)\(tail)"
     }
 
     // MARK: 配置文件读写

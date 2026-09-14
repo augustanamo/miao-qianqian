@@ -10,7 +10,7 @@ NATIVE_DIR="$TOOL_DIR/native"
 APP_NAME="喵签签"
 APP_DIR="$TOOL_DIR/${APP_NAME}.app"
 
-echo "==> 1/4 检测 Swift 工具链"
+echo "==> 1/5 检测 Swift 工具链"
 SWIFT="$(command -v swift || true)"
 if [ -z "$SWIFT" ]; then
   echo "错误：未找到 swift，请安装 Xcode 或 CommandLineTools。"
@@ -18,7 +18,7 @@ if [ -z "$SWIFT" ]; then
 fi
 "$SWIFT" --version | head -1
 
-echo "==> 2/4 编译 Swift 工程（swift build）"
+echo "==> 2/5 编译 Swift 工程（swift build）"
 cd "$NATIVE_DIR"
 BUILD_OK=0
 # 优先直接构建；若因 SDK/编译器版本不匹配失败，则逐个尝试 CLT 内置 SDK
@@ -50,7 +50,7 @@ if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
   exit 1
 fi
 
-echo "==> 3/4 组装 $APP_NAME.app"
+echo "==> 3/5 组装 $APP_NAME.app"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BIN" "$APP_DIR/Contents/MacOS/AutoCheck"
 chmod +x "$APP_DIR/Contents/MacOS/AutoCheck"
@@ -90,7 +90,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-echo "==> 4/4 生成应用图标（可选）"
+echo "==> 4/5 生成应用图标（可选）"
 if [ -f "$TOOL_DIR/assets/AppIcon.icns" ]; then
   cp "$TOOL_DIR/assets/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
   echo "   已使用自定义图标：$TOOL_DIR/assets/AppIcon.icns"
@@ -102,6 +102,38 @@ else
   else
     echo "   提示：未找到 python3，图标使用默认图标。"
   fi
+fi
+
+# 平台真实图标（Trae / WorkBuddy）：账号列表与签到表格的头像用。
+# 取不到的平台会自动回退为首字方块，缺图不影响运行。
+if [ -d "$TOOL_DIR/assets/platform-icons" ]; then
+  icon_n=0
+  for png in "$TOOL_DIR/assets/platform-icons"/*.png; do
+    [ -f "$png" ] || continue
+    cp "$png" "$APP_DIR/Contents/Resources/"
+    icon_n=$((icon_n + 1))
+  done
+  if [ "$icon_n" -gt 0 ]; then
+    echo "   已复制 $icon_n 个平台图标到 Resources"
+  else
+    echo "   提示：assets/platform-icons 下没有 PNG，平台头像将使用首字方块。"
+  fi
+fi
+
+echo "==> 5/5 重做 ad-hoc 代码签名"
+# 必须放在 Info.plist 和图标都就位之后：这两者任一变化都会让已有签名失效。
+# 原因：swift build 给 .build 里的中间产物打的 ad-hoc 签名声明了 CodeResources，
+# 直接 cp 进 .app 后包内没有 _CodeSignature 目录，签名结构不完整 ——
+# codesign --verify 退出码 1（code has no resources but signature indicates they must be present），
+# arm64 上双击可能被系统直接拒绝。
+if codesign --force --sign - "$APP_DIR" >/dev/null 2>&1; then
+  if codesign --verify --strict "$APP_DIR" >/dev/null 2>&1; then
+    echo "   签名有效（ad-hoc，标识符 com.marvis.autocheck）"
+  else
+    echo "   警告：签名校验未通过。若双击被系统拦截，执行：xattr -cr \"$APP_DIR\""
+  fi
+else
+  echo "   提示：codesign 不可用，已跳过签名（双击若被拦截见上面的 xattr 提示）。"
 fi
 
 echo "已生成：${APP_DIR}"

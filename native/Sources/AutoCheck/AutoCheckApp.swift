@@ -10,15 +10,25 @@ struct AutoCheckApp: App {
         WindowGroup("喵签签") {
             ContentView()
                 .environmentObject(model)
-                .frame(minWidth: 1120, minHeight: 700)
+                // 强制浅色外观：界面按浅色设计稿绘制（深黑侧边栏 + 白卡片），
+                // 避免系统深色模式下 Color.primary 变白，导致输入框/胶囊/正文白字看不清。
+                .preferredColorScheme(.light)
+                .frame(minWidth: 1280, minHeight: 760)
                 .onAppear {
                     model.start()
                     appDelegate.bind(model: model)
+                    // 最彻底：整个 App（含弹窗/菜单/选框）统一强制浅色（aqua）
+                    NSApp.appearance = NSAppearance(named: .aqua)
                     NSApp.setActivationPolicy(.regular)
                     NSApp.activate(ignoringOtherApps: true)
                 }
         }
         .windowResizability(.contentMinSize)
+        // 隐藏系统标题栏：顶栏完全自绘（图标 + 品牌 + 运行状态胶囊 + 手动签到），
+        // 交通灯仍由系统绘制在左上角，顶栏左侧预留 78pt 让位。
+        .windowStyle(.hiddenTitleBar)
+        // 默认窗口尺寸对齐设计稿画布 1440×900
+        .defaultSize(width: 1440, height: 900)
     }
 }
 
