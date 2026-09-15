@@ -50,11 +50,26 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// 单个账号的积分/余额快照。
+    /// 来源：checkin.py --credits --json 输出里 items 的每一条。
+    /// 各平台口径不同（Trae 积分 / B站硬币 / 联想乐豆 / 京豆），unit 标明实际单位。
     struct CreditInfo: Hashable {
-        var total: Double = 0
-        var used: Double = 0
-        var remaining: Double = 0
-        var detail: String = ""
+        /// 账号当前可用余额；nil 表示该平台没有给出余额（如京东无公开接口）
+        var balance: Double? = nil
+        var used: Double? = nil
+        var limit: Double? = nil
+        var streak: Int? = nil
+        /// 平台侧单位：积分 / 硬币 / 乐豆 / 京豆
+        var unit: String = "积分"
+        /// 平台展示名（Trae / WorkBuddy / Bilibili …）
+        var label: String = ""
+        /// 该账号余额是否查询成功
+        var ok: Bool = false
+        /// 平台侧状态文案（今日已签 / 今日未签 / 登录态正常 …）
+        var state: String = ""
+        var summary: String = ""
+        /// 失败原因或"该平台未提供余额"的说明
+        var message: String = ""
     }
 
     // MARK: 启动 / 刷新
@@ -106,13 +121,15 @@ final class AppModel: ObservableObject {
     // MARK: 派生数据
     func enabledAccounts() -> [Account] { accounts.filter { $0.isEnabled } }
 
-    func todaySummary() -> (done: Int, fail: Int, pending: Int, credit: Double, total: Int) {
+    func todaySummary() -> (done: Int, fail: Int, pending: Int, credit: Double, total: Int, restricted: Int) {
         let today = DayTool.today()
         // 以「启用账号」为口径汇总，避免把已删除/未启用账号的日志计入；
         // 通过 parsed.status 的前缀兼容匹配，确保日志名与账号名存在差异时也能正确归类（如"132" vs "132trae"）。
+        // restricted 单列：平台受限不代表失败，不该计进 fail，也不该触发失败重试。
         let en = enabledAccounts()
         var doneCount = 0
         var failCount = 0
+        var restrictedCount = 0
         var pendingCount = 0
         var credit = 0.0
         for acc in en {
@@ -121,21 +138,35 @@ final class AppModel: ObservableObject {
             case "done":
                 doneCount += 1
                 if let h = st.hit { credit += h.credits }
+            case "restricted":
+                restrictedCount += 1
             case "fail":
                 failCount += 1
             default:
                 pendingCount += 1
             }
         }
-        return (doneCount, failCount, pendingCount, credit, en.count)
+        return (doneCount, failCount, pendingCount, credit, en.count, restrictedCount)
     }
 
     func accStatus(_ name: String) -> (state: String, hit: LogHit?) {
         parsed.status(name: name, on: DayTool.today())
     }
 
-    func totalRemainingCredits() -> Double {
-        creditsByAccount.values.reduce(0) { $0 + $1.remaining }
+    /// 所有**启用**账号的积分/余额合计。
+    /// 注意各平台单位不同（积分/硬币/乐豆），这里是"点数总和"，
+    /// 界面上会给出逐账号明细标明单位，便于核对。
+    func totalCredits() -> Double {
+        enabledAccounts().reduce(0) { sum, acc in
+            sum + (creditsByAccount[acc.name]?.balance ?? 0)
+        }
+    }
+
+    /// 已查询到的账号数（余额非空），用于说明合计覆盖了几个账号
+    func creditsCoverage() -> (counted: Int, total: Int) {
+        let en = enabledAccounts()
+        let counted = en.filter { creditsByAccount[$0.name]?.balance != nil }.count
+        return (counted, en.count)
     }
 
     func chartData(days: Int) -> [Double] {
@@ -213,7 +244,7 @@ final class AppModel: ObservableObject {
         let proc = runPythonStream([AppPaths.projectDir + "/checkin.py", "--only", name]) { [weak self] line in
             guard let self = self else { return }
             self.runLines.append(line)
-            if line.contains("[OK]") || line.contains("[FAIL]") {
+            if line.contains("[OK]") || line.contains("[FAIL]") || line.contains("[受限]") {
                 // 解析已含时间戳的行，用于实时刷新表格
                 self.parseLogs()
             }
@@ -223,7 +254,7 @@ final class AppModel: ObservableObject {
             self.singleSignName = nil
             let summary = self.todaySummary()
             self.refreshCredits()
-            self.showToast("\(name) 签到完成：成功 \(summary.done)，失败 \(summary.fail)",
+            self.showToast("\(name) 签到完成：\(self.summaryText(summary))",
                            summary.fail == 0 ? .success : .error)
         }
         runningProcess = proc
@@ -238,7 +269,7 @@ final class AppModel: ObservableObject {
         let proc = runPythonStream([AppPaths.projectDir + "/checkin.py", "--only", name]) { [weak self] line in
             guard let self = self else { return }
             self.runLines.append(line)
-            if line.contains("[OK]") || line.contains("[FAIL]") {
+            if line.contains("[OK]") || line.contains("[FAIL]") || line.contains("[受限]") {
                 // 解析已含时间戳的行，用于实时刷新表格
                 self.parseLogs()
             }
@@ -275,16 +306,28 @@ final class AppModel: ObservableObject {
         refreshCredits()
         if pref.notifyOnComplete {
             sendNotification(title: "自动签到完成",
-                             body: "成功 \(summary.done)，失败 \(summary.fail)，共 \(summary.total) 个账号")
+                             body: "\(summaryText(summary))，共 \(summary.total) 个账号")
         }
-        showToast("签到完成：成功 \(summary.done)，失败 \(summary.fail)", summary.fail == 0 ? .success : .error)
+        showToast("签到完成：\(summaryText(summary))", summary.fail == 0 ? .success : .error)
+    }
+
+    /// 结果文案：「成功 X，平台受限 Y（有才显示），失败 Z」。
+    /// 平台受限单列，避免把"京东活动下线"这种平台侧问题报成账号失败。
+    private func summaryText(_ s: (done: Int, fail: Int, pending: Int,
+                                   credit: Double, total: Int, restricted: Int)) -> String {
+        var parts = ["成功 \(s.done)"]
+        if s.restricted > 0 { parts.append("平台受限 \(s.restricted)") }
+        parts.append("失败 \(s.fail)")
+        return parts.joined(separator: "，")
     }
 
     // MARK: 积分
+    /// 刷新各账号积分/余额。走 `checkin.py --credits --json` 拿机读记录，
+    /// 避免在 Swift 侧用正则去啃中文文案（各平台文案格式不一致，很容易漏)。
     func refreshCredits(only: String? = nil) {
         guard !creditsRunning else { return }
         creditsRunning = true
-        var args = [AppPaths.projectDir + "/checkin.py", "--credits"]
+        var args = [AppPaths.projectDir + "/checkin.py", "--credits", "--json"]
         if let only = only { args += ["--only", only] }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let r = runPythonCapture(args, timeout: 90)
@@ -296,39 +339,38 @@ final class AppModel: ObservableObject {
     }
 
     private func parseCreditsOutput(_ text: String) {
+        // 只认 "[CREDITS_JSON] {...}" 这一行：它由脚本用 print 输出（无时间戳、
+        // 不写 checkin.log），因此不会被日志解析当成签到记录。
+        let marker = "[CREDITS_JSON] "
+        guard let line = text.split(separator: "\n").last(where: { $0.hasPrefix(marker) }),
+              let data = String(line.dropFirst(marker.count)).data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = obj["items"] as? [[String: Any]] else { return }
         var newCredits: [String: CreditInfo] = [:]
-        for line in text.split(separator: "\n") {
-            let s = String(line)
-            if let m = matchCredits(s) {
-                newCredits[m.name] = CreditInfo(total: m.total, used: m.used, remaining: m.remaining, detail: m.detail)
-            }
+        for it in items {
+            guard let name = it["name"] as? String else { continue }
+            var c = CreditInfo()
+            c.balance = num(it["balance"])
+            c.used = num(it["used"])
+            c.limit = num(it["limit"])
+            c.streak = num(it["streak_days"]).map { Int($0) }
+            c.unit = it["unit"] as? String ?? "积分"
+            c.label = it["label"] as? String ?? ""
+            c.ok = it["ok"] as? Bool ?? false
+            c.state = it["state"] as? String ?? ""
+            c.summary = it["summary"] as? String ?? ""
+            c.message = it["message"] as? String ?? ""
+            newCredits[name] = c
         }
-        if !newCredits.isEmpty {
-            creditsByAccount = newCredits
-        }
+        creditsByAccount = newCredits
     }
 
-    private func matchCredits(_ s: String) -> (name: String, total: Double, used: Double, remaining: Double, detail: String)? {
-        guard let mark = s.range(of: "[积分] ") else { return nil }
-        let tail = String(s[mark.upperBound...])
-        guard let openP = tail.firstIndex(of: "("), let closeP = tail.firstIndex(of: ")"), openP < closeP else { return nil }
-        let name = String(tail[..<openP]).trimmingCharacters(in: .whitespaces)
-        guard let total = doubleAfter(tail, "总限额"),
-              let used = doubleAfter(tail, "已用"),
-              let remaining = doubleAfter(tail, "剩余") else { return nil }
-        let detail = String(tail[tail.index(after: closeP)...]).trimmingCharacters(in: .whitespaces)
-        return (name, total, used, remaining, detail)
-    }
-
-    private func doubleAfter(_ s: String, _ key: String) -> Double? {
-        guard let r = s.range(of: key) else { return nil }
-        // key 后可能先跟空格/全角逗号等分隔符再出现数字（如"总限额 4650，已用 2142.69"），
-        // 必须先跳过分隔符再取数字，否则 prefix 立即因首字符不是数字而返回空。
-        let rest = String(s[r.upperBound...])
-        let trimmed = rest.drop(while: { $0.isWhitespace || $0 == "，" || $0 == "," })
-        let digits = trimmed.prefix { $0.isNumber || $0 == "." }
-        guard !digits.isEmpty else { return nil }
-        return Double(String(digits))
+    /// JSON 数值转换。JSON null → nil；JSON 的 true/false 也会桥接成 NSNumber，
+    /// 需显式排除，避免把布尔当成余额。
+    private func num(_ v: Any?) -> Double? {
+        guard let v = v, !(v is NSNull) else { return nil }
+        if v is Bool { return nil }
+        return (v as? NSNumber)?.doubleValue
     }
 
     // MARK: 账号操作
@@ -370,44 +412,18 @@ final class AppModel: ObservableObject {
         loadAccounts()
     }
 
-    func addAccountCurl(name: String, app: String, curl: String, enabled: Bool = true,
-                        onDone: ((Bool) -> Void)? = nil) {
-        let nameT = name.trimmingCharacters(in: .whitespaces)
-        let appT = app.trimmingCharacters(in: .whitespaces).lowercased()
-        let curlT = curl.trimmingCharacters(in: .whitespaces)
-        guard !nameT.isEmpty, !appT.isEmpty, !curlT.isEmpty else {
-            showToast("账号名/所属软件/cURL 不能为空", .error)
-            onDone?(false)
-            return
-        }
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let args = [AppPaths.projectDir + "/curl_to_account.py",
-                        "--name", nameT, "--app", appT, "--curl", curlT,
-                        "--replace", "--enabled", enabled ? "1" : "0"]
-            let r = runPythonCapture(args, timeout: 30)
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                let ok = (r.code == 0) || r.out.contains("已保存")
-                self.showToast(ok ? "已保存账号「\(nameT)」" : "保存失败：\(r.out)", ok ? .success : .error)
-                if ok {
-                    self.loadAccounts()
-                    self.showingAddPanel = false   // 仅保存成功才关闭面板，失败保留输入
-                }
-                onDone?(ok)
-            }
-        }
-    }
-
+    /// Trae 浏览器登录。name 可留空：脚本按账号 ID 自动命名
+    /// （Trae 登录态只有账号 ID，不含昵称）。
     func runTraeLogin(name: String, enabled: Bool = true) {
         let nameT = name.trimmingCharacters(in: .whitespaces)
         if let cur = loginAccount, cur != nameT {
             showToast("请先等待账号「\(cur)」登录完成", .error)
             return
         }
-        if nameT.isEmpty { showToast("请输入账号名称", .error); return }
         loginRunning = true
-        loginAccount = nameT
-        loginLines = ["正在打开内置浏览器（账号 \(nameT)）…", "请在浏览器窗口中完成 Trae 登录，程序会自动识别并保存。"]
+        loginAccount = nameT.isEmpty ? "(自动命名)" : nameT
+        loginLines = ["正在打开内置浏览器（\(nameT.isEmpty ? "账号名称将自动读取" : "账号 " + nameT)）…",
+                      "请在浏览器窗口中完成 Trae 登录，程序会自动识别并保存。"]
         runningProcess = runPythonStream([AppPaths.projectDir + "/trae_login.py", "--name", nameT,
                                           "--enabled", enabled ? "1" : "0"]) { [weak self] line in
             self?.loginLines.append(line)
@@ -426,7 +442,78 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Cookie 型平台浏览器登录（Bilibili / 联想智选 / 京东）：
+    /// 弹出内置浏览器，用户扫码/账密登录后自动抓取 Cookie 写回 accounts.json，
+    /// 完成后后台校验并回填昵称。Cookie 等同密码，仅本机存储，UI/日志不回显明文。
+    /// name 可留空：脚本会在验证通过后读取该账号真实昵称自动命名。
+    func runCookieBrowserLogin(type: String, name: String, enabled: Bool = true) {
+        let nameT = name.trimmingCharacters(in: .whitespaces)
+        guard let meta = Self.cookiePlatforms.first(where: { $0.type == type }) else {
+            showToast("未知平台类型", .error); return
+        }
+        if let cur = loginAccount, cur != nameT {
+            showToast("请先等待账号「\(cur)」登录完成", .error)
+            return
+        }
+        loginRunning = true
+        loginAccount = nameT.isEmpty ? "(自动命名)" : nameT
+        loginLines = ["正在打开内置浏览器（\(meta.label)\(nameT.isEmpty ? "／账号名称将自动读取" : " / " + nameT)）…",
+                      "请在浏览器窗口中扫码或账密登录，程序会自动抓取 Cookie 并保存（等同密码，仅本机存储）。"]
+        runningProcess = runPythonStream([AppPaths.projectDir + "/browser_login.py", "--platform", type,
+                                          "--name", nameT, "--enabled", enabled ? "1" : "0"]) { [weak self] line in
+            self?.loginLines.append(line)
+        } completion: { [weak self] code in
+            self?.loginRunning = false
+            self?.loginAccount = nil
+            guard let self = self else { return }
+            if code == 0 {
+                self.loadAccounts()
+                self.showToast("登录完成，账号已保存", .success)
+                // 名称留空时脚本已按昵称自动命名，无需（也无法）再按名回填昵称
+                if !nameT.isEmpty {
+                    self.probeCookieNickname(type: type, name: nameT)   // 后台校验并回填昵称
+                }
+            } else {
+                self.showToast("登录未完成或已取消", .error)
+            }
+        }
+    }
+
     // MARK: WorkBuddy
+    /// WorkBuddy 扫码登录（OAuth device flow）添加账号：
+    /// 启动 workbuddy_login.py，用内置浏览器（与 Trae / Cookie 平台同一套）打开
+    /// 授权页完成扫码，每次都是全新的干净 profile；Playwright 不可用时脚本自动
+    /// 回退系统浏览器。登录成功后 accessToken/refreshToken 由脚本写回
+    /// accounts.json（.gitignore 排除），UI/日志只显示授权 URL 与脱敏结果，
+    /// 绝不回显 token 明文。name 留空时脚本自动以昵称命名。
+    func runWorkBuddyOAuth(name: String, enabled: Bool = true) {
+        let nameT = name.trimmingCharacters(in: .whitespaces)
+        if let cur = loginAccount, cur != nameT {
+            showToast("请先等待账号「\(cur)」登录完成", .error)
+            return
+        }
+        loginRunning = true
+        loginAccount = nameT.isEmpty ? "(自动命名)" : nameT
+        loginLines = ["正在发起 WorkBuddy OAuth 扫码登录…",
+                      "内置浏览器将打开授权页，请扫码并在页面中确认；登录成功会自动保存账号（token 等同密码，仅本机存储）。"]
+        runningProcess = runPythonStream([AppPaths.projectDir + "/workbuddy_login.py",
+                                          "--name", nameT, "--enabled", enabled ? "1" : "0"]) { [weak self] line in
+            self?.loginLines.append(line)
+        } completion: { [weak self] code in
+            self?.loginRunning = false
+            self?.loginAccount = nil
+            guard let self = self else { return }
+            if code == 0 {
+                self.loadAccounts()
+                self.showToast("扫码登录完成，账号已保存", .success)
+            } else if code == 2 {
+                self.showToast("已取消扫码登录", .error)
+            } else {
+                self.showToast("扫码登录失败，请重试", .error)
+            }
+        }
+    }
+
     /// 本机 WorkBuddy 登录态健康探针。nil=未探测；true=文件存在且有 accessToken。
     @Published var wbHealthy: Bool? = nil
     /// 本机 WorkBuddy 昵称（仅用于展示，脱敏无敏感信息）
@@ -584,6 +671,134 @@ final class AppModel: ObservableObject {
         return f.string(from: Date())
     }
 
+    // MARK: Cookie 型平台（Bilibili / 联想智选 / 京东）
+    /// 平台元数据：type -> (标签, accounts.json 的 auth 字段名)
+    static let cookiePlatforms: [(type: String, label: String, authKey: String)] = [
+        ("bilibili", "Bilibili", "bilibili_auth"),
+        ("lenovo", "联想智选", "lenovo_auth"),
+        ("jd", "京东", "jd_auth"),
+    ]
+
+    static func cookieScript(for type: String) -> String? {
+        switch type {
+        case "bilibili": return "bilibili.py"
+        case "lenovo": return "lenovo.py"
+        case "jd": return "jd.py"
+        default: return nil
+        }
+    }
+
+    /// 添加/更新 Cookie 型平台账号。cookie 等同密码：仅写入 accounts.json
+    ///（已被 .gitignore 排除），UI 与日志一律不回显明文。
+    func addCookieAccount(type: String, name: String, cookie: String, enabled: Bool = true,
+                          onDone: ((Bool) -> Void)? = nil) {
+        guard let meta = Self.cookiePlatforms.first(where: { $0.type == type }) else {
+            showToast("未知平台类型", .error); onDone?(false); return
+        }
+        let nameT = name.trimmingCharacters(in: .whitespaces)
+        let cookieT = cookie.trimmingCharacters(in: .whitespaces)
+        guard !nameT.isEmpty, !cookieT.isEmpty else {
+            showToast("账号名与 Cookie 不能为空", .error); onDone?(false); return
+        }
+        guard var root = readJSONRoot() ?? (["accounts": [] as [[String: Any]]] as [String: Any]?),
+              var arr = root["accounts"] as? [[String: Any]] else {
+            showToast("读取账号配置失败", .error); onDone?(false); return
+        }
+        var entry: [String: Any] = [
+            "name": nameT,
+            "app": meta.label,
+            "type": type,
+            "enabled": enabled,
+            meta.authKey: [
+                "cookie": cookieT,
+                "saved_at": nowString(),
+                "updated_at": nowString(),
+            ],
+        ]
+        if let i = arr.firstIndex(where: { ($0["name"] as? String) == nameT }) {
+            let old = arr[i]
+            guard (old["type"] as? String) == type else {
+                showToast("同名账号「\(nameT)」已存在且平台不同，请换一个名称", .error); onDone?(false); return
+            }
+            entry["enabled"] = old["enabled"] ?? enabled
+            arr[i] = entry
+        } else {
+            arr.append(entry)
+        }
+        root["accounts"] = arr
+        guard writeJSONRoot(root) else {
+            showToast("保存账号失败", .error); onDone?(false); return
+        }
+        loadAccounts()
+        showingAddPanel = false
+        showToast("已添加 \(meta.label) 账号「\(nameT)」", .success)
+        probeCookieNickname(type: type, name: nameT)   // 后台校验并回填昵称，不阻塞添加
+        onDone?(true)
+    }
+
+    /// 更新已有 Cookie 型账号的 Cookie（重新登录/换号）
+    func refreshCookieAccount(type: String, name: String, cookie: String) {
+        guard let meta = Self.cookiePlatforms.first(where: { $0.type == type }),
+              var root = readJSONRoot(),
+              var arr = root["accounts"] as? [[String: Any]] else { return }
+        let cookieT = cookie.trimmingCharacters(in: .whitespaces)
+        guard !cookieT.isEmpty else {
+            showToast("Cookie 不能为空", .error); return
+        }
+        for i in arr.indices where arr[i]["name"] as? String == name {
+            arr[i]["type"] = type
+            arr[i]["app"] = meta.label
+            var auth = (arr[i][meta.authKey] as? [String: Any]) ?? [:]
+            auth["cookie"] = cookieT
+            auth["updated_at"] = nowString()
+            arr[i][meta.authKey] = auth
+        }
+        root["accounts"] = arr
+        if writeJSONRoot(root) {
+            loadAccounts()
+            showToast("已更新「\(name)」的 Cookie", .success)
+            probeCookieNickname(type: type, name: name)
+        } else {
+            showToast("保存失败", .error)
+        }
+    }
+
+    /// 后台探测 Cookie 有效性并回填昵称（只读，不阻塞添加流程）。
+    /// 校验失败仅提示，不删除已保存的账号。
+    private func probeCookieNickname(type: String, name: String) {
+        guard let script = Self.cookieScript(for: type) else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let r = runPythonCapture([AppPaths.projectDir + "/" + script, "--probe", "--name", name], timeout: 25)
+            let obj = (try? JSONSerialization.jsonObject(with: r.out.data(using: .utf8) ?? Data())) as? [String: Any]
+            let nickname = obj?["nickname"] as? String ?? ""
+            let healthy = obj?["healthy"] as? Bool ?? false
+            let message = obj?["message"] as? String ?? ""
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if !nickname.isEmpty {
+                    self.updateCookieNickname(name: name, nickname: nickname)
+                }
+                if !healthy {
+                    self.showToast("Cookie 校验未通过：\(message.isEmpty ? "无法登录，请检查后重试" : message)", .error)
+                }
+            }
+        }
+    }
+
+    private func updateCookieNickname(name: String, nickname: String) {
+        guard var root = readJSONRoot(), var arr = root["accounts"] as? [[String: Any]] else { return }
+        for i in arr.indices where arr[i]["name"] as? String == name {
+            guard let type = arr[i]["type"] as? String,
+                  let meta = Self.cookiePlatforms.first(where: { $0.type == type }) else { continue }
+            var auth = (arr[i][meta.authKey] as? [String: Any]) ?? [:]
+            auth["nickname"] = nickname
+            arr[i][meta.authKey] = auth
+        }
+        root["accounts"] = arr
+        _ = writeJSONRoot(root)
+        loadAccounts()
+    }
+
     // MARK: launchd
     func autoToggle(_ on: Bool) {
         if on {
@@ -654,11 +869,26 @@ final class AppModel: ObservableObject {
     }
 
     private func dailyDigestBody() -> String {
-        let pending = accounts.filter { $0.isEnabled && accStatus($0.name).state != "done" }
-        if pending.isEmpty { return "今日所有启用账号均已签到完成" }
-        let names = pending.prefix(4).map { $0.name }.joined(separator: "、")
-        let tail = pending.count > 4 ? " 等" : ""
-        return "还有 \(pending.count) 个账号未签到：\(names)\(tail)"
+        // 平台受限的账号不算"未签到"（对方活动下线/风控，用户没什么可做的），
+        // 但要在摘要里点一句，免得用户看到"全部完成"又发现状态是橙的。
+        let enabled = accounts.filter { $0.isEnabled }
+        let pending = enabled.filter {
+            let s = accStatus($0.name).state
+            return s != "done" && s != "restricted"
+        }
+        let restricted = enabled.filter { accStatus($0.name).state == "restricted" }
+        var text: String
+        if pending.isEmpty {
+            text = "今日所有启用账号均已签到完成"
+        } else {
+            let names = pending.prefix(4).map { $0.name }.joined(separator: "、")
+            let tail = pending.count > 4 ? " 等" : ""
+            text = "还有 \(pending.count) 个账号未签到：\(names)\(tail)"
+        }
+        if !restricted.isEmpty {
+            text += "；\(restricted.count) 个账号平台受限（非失败）"
+        }
+        return text
     }
 
     // MARK: 配置文件读写

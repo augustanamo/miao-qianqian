@@ -25,6 +25,9 @@ WorkBuddy 专用签到 API 客户端（仅标准库，无第三方依赖）
 
 import json
 import os
+import re
+import sys
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -150,6 +153,383 @@ def _read_token() -> str:
     if not token:
         raise WorkBuddyError("WorkBuddy 登录态缺少 accessToken")
     return token
+
+
+# ----------------------------------------------------------------------
+# 多账号支持（OAuth 扫码登录态存于 accounts.json 的 workbuddy_auth 字段）
+# 约定：access_token / refresh_token 等同账号密码，仅写入 accounts.json
+#       （已被 .gitignore 排除），仅内存使用，绝不写日志、绝不回显明文。
+# ----------------------------------------------------------------------
+ACCOUNTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts.json")
+OAUTH_BASE = "https://www.codebuddy.cn"
+OAUTH_PREFIX = "/v2/plugin"
+_JWT_PAT = re.compile(r"eyJ[A-Za-z0-9_\-]{10,}(?:\.[A-Za-z0-9_\-]+){1,2}")
+
+
+def _redact(text: str) -> str:
+    """对描述文本中的 JWT 形态子串打码，防止意外回显 token。"""
+    return _JWT_PAT.sub("[token]", str(text))
+
+
+def mask_token(value: str) -> str:
+    """Token 脱敏展示：空 -> "(空)"；否则保留前 8 位后打码。"""
+    value = (value or "").strip()
+    if not value:
+        return "(空)"
+    if len(value) <= 12:
+        return "******"
+    return value[:8] + "******"
+
+
+def _to_ms(v):
+    """统一为绝对毫秒时间戳；非法值返回 None。兼容相对秒/绝对秒/毫秒。"""
+    if v is None or v == "":
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f < 100_000:
+        return int(time.time() * 1000 + f * 1000)   # 相对秒
+    if f < 100_000_000_000:
+        return int(f * 1000)                         # 绝对秒
+    return int(f)                                     # 绝对毫秒
+
+
+def _jwt_exp(token: str):
+    """解析 JWT exp（返回毫秒时间戳），解析失败返回 None。"""
+    try:
+        parts = (token or "").split(".")
+        if len(parts) < 2:
+            return None
+        payload = parts[1]
+        payload += "=" * (-len(payload) % 4)
+        import base64
+        data = base64.urlsafe_b64decode(payload)
+        obj = json.loads(data)
+        exp = obj.get("exp")
+        if exp is None:
+            return None
+        exp = float(exp)
+        return exp if exp > 10_000_000_000 else exp * 1000
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def load_workbuddy_accounts(config_path: str | None = None) -> list:
+    """从 accounts.json 读取所有 workbuddy 账号（token 仅内存返回）。
+
+    返回列表，每项：
+      {name, enabled, uid, nickname, domain, enterprise_id, source,
+       token, refresh_token, expires_at(ms), refresh_expires_at(ms)}
+    source: "oauth"（accounts.json 内 token）或 "local"（本机登录态回退）。
+    """
+    from cookie_manager import load_config
+    cfg = load_config(config_path)
+    out = []
+    for acc in cfg.get("accounts", []):
+        if not isinstance(acc, dict) or acc.get("type") != "workbuddy":
+            continue
+        auth = acc.get("workbuddy_auth") or {}
+        if not isinstance(auth, dict):
+            auth = {}
+        token = (auth.get("access_token") or "").strip()
+        out.append({
+            "name": acc.get("name", "?"),
+            "enabled": bool(acc.get("enabled", True)),
+            "uid": (auth.get("uid") or "").strip(),
+            "nickname": (auth.get("nickname") or "").strip(),
+            "domain": (auth.get("domain") or "").strip(),
+            "enterprise_id": (auth.get("enterprise_id") or "").strip(),
+            "source": "oauth" if token else "local",
+            "token": token,
+            "refresh_token": (auth.get("refresh_token") or "").strip(),
+            "expires_at": _to_ms(auth.get("expires_at")),
+            "refresh_expires_at": _to_ms(auth.get("refresh_expires_at")),
+        })
+    return out
+
+
+def account_token(acc: dict) -> str:
+    """取账号 accessToken（仅内存返回，绝不落盘/打印）。
+
+    优先 accounts.json 内 workbuddy_auth.access_token（OAuth 多账号）；
+    无则回退本机登录态文件（旧版单账号路径，保持兼容）。
+    两者均不可用时抛 WorkBuddyError（中文可读提示）。
+    """
+    if isinstance(acc, dict):
+        auth = acc.get("workbuddy_auth") or {}
+        if isinstance(auth, dict):
+            t = (auth.get("access_token") or "").strip()
+            if t:
+                return t
+    return _read_token()  # 回退本机登录态
+
+
+def _now_str() -> str:
+    import datetime
+    dt = datetime.datetime.now()
+    return f"{dt.year}-{dt.month:02d}-{dt.day:02d} {dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}"
+
+
+def save_oauth_tokens(config_path: str | None, name: str, tokens: dict) -> bool:
+    """把 OAuth token 快照写回 accounts.json 对应账号（原子写，自动建号）。
+
+    tokens 字段：access_token/refresh_token/expires_at/refresh_expires_at/
+                 token_type/domain/uid/nickname/email/enterprise_id/source。
+    同名账号保留原启用状态与历史非敏感快照；新账号默认启用。
+    """
+    from cookie_manager import load_config, save_config
+    cfg = load_config(config_path)
+    arr = cfg.get("accounts", [])
+    auth = {
+        "access_token": (tokens.get("access_token") or "").strip(),
+        "refresh_token": (tokens.get("refresh_token") or "").strip(),
+        "expires_at": tokens.get("expires_at"),
+        "refresh_expires_at": tokens.get("refresh_expires_at"),
+        "token_type": tokens.get("token_type") or "",
+        "domain": tokens.get("domain") or "",
+        "uid": tokens.get("uid") or "",
+        "nickname": tokens.get("nickname") or "",
+        "email": tokens.get("email") or "",
+        "enterprise_id": tokens.get("enterprise_id") or "",
+        "saved_at": _now_str(),
+        "source": tokens.get("source") or "oauth",
+    }
+    auth = {k: v for k, v in auth.items() if v not in (None, "")}
+    idx = next((i for i, a in enumerate(arr)
+                if isinstance(a, dict) and a.get("name") == name), None)
+    if idx is not None:
+        old = arr[idx]
+        if not isinstance(old.get("workbuddy_auth"), dict):
+            old["workbuddy_auth"] = {}
+        old["workbuddy_auth"].update(auth)
+        old["type"] = "workbuddy"
+        old["app"] = "workbuddy"
+        arr[idx] = old
+    else:
+        arr.append({
+            "name": name,
+            "app": "workbuddy",
+            "type": "workbuddy",
+            "enabled": True,
+            "workbuddy_auth": auth,
+        })
+    cfg["accounts"] = arr
+    return save_config(cfg, config_path)
+
+
+def refresh_access_token(refresh_token: str, domain: str = "") -> dict:
+    """用 refreshToken 换新 token（OAuth device flow 协议，仅标准库）。
+
+    返回 dict：{ok, http, message, access_token, refresh_token,
+                expires_at(ms), refresh_expires_at(ms), token_type, domain}
+    """
+    headers = {
+        "Authorization": "Bearer " + (refresh_token or "").strip(),
+        "X-Refresh-Token": (refresh_token or "").strip(),
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": _UA,
+    }
+    if domain:
+        headers["X-Domain"] = domain
+    req = urllib.request.Request(
+        OAUTH_BASE + OAUTH_PREFIX + "/auth/token/refresh",
+        data=b"{}", headers=headers, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            status, text = resp.status, resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        status, text = e.code, e.read().decode("utf-8", errors="replace")
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "http": -1, "message": f"网络异常：{e}"}
+    body = _loads_body(text)
+    data = body.get("data") if isinstance(body.get("data"), dict) else body
+    if status in (401, 403):
+        return {"ok": False, "http": status, "message": "refreshToken 已失效，请重新扫码登录"}
+    if status != 200:
+        return {"ok": False, "http": status, "message": _resp_msg(body) or f"HTTP {status}"}
+    token = data.get("accessToken") or data.get("access_token") or ""
+    if not token:
+        return {"ok": False, "http": status, "message": "刷新响应缺少 accessToken"}
+    new_refresh = data.get("refreshToken") or data.get("refresh_token") or (refresh_token or "")
+    return {
+        "ok": True,
+        "http": status,
+        "message": "",
+        "access_token": token,
+        "refresh_token": new_refresh,
+        "expires_at": _to_ms(data.get("expiresAt") or data.get("expiresIn")),
+        "refresh_expires_at": _to_ms(data.get("refreshExpiresAt") or data.get("refreshExpiresIn")),
+        "token_type": data.get("tokenType") or data.get("token_type") or "",
+        "domain": data.get("domain") or domain,
+    }
+
+
+def checkin_account(entry: dict, config_path: str | None = None,
+                    growth: bool = True) -> dict:
+    """单账号签到（幂等）+ 可选成长中心。token 仅内存，返回脱敏结果。
+
+    签到/查状态遇 401/403 时，若账号有 refresh_token 自动续期并写回，
+    续期失败或无可续期凭证时给出中文可读提示。
+    """
+    name = entry["name"]
+    result = {"name": name, "source": entry["source"], "ok": False, "desc": ""}
+
+    def _build() -> WorkBuddyClient:
+        return WorkBuddyClient(
+            entry["token"],
+            uid=entry.get("uid") or "",
+            domain=entry.get("domain") or "",
+            enterprise_id=entry.get("enterprise_id") or "",
+        )
+
+    try:
+        client = _build()
+    except WorkBuddyError as e:
+        result["desc"] = f"签到失败：{e}"
+        return result
+
+    def _refresh_once() -> bool:
+        """尝试用 refreshToken 续期并写回；返回是否成功。"""
+        if not (entry.get("refresh_token") or "").strip():
+            return False
+        r = refresh_access_token(entry["refresh_token"], entry.get("domain") or "")
+        if not r.get("ok"):
+            return False
+        entry["token"] = r["access_token"]
+        entry["refresh_token"] = r.get("refresh_token") or entry["refresh_token"]
+        entry["expires_at"] = r.get("expires_at")
+        entry["refresh_expires_at"] = r.get("refresh_expires_at")
+        if config_path:
+            save_oauth_tokens(config_path, name, {
+                "access_token": entry["token"],
+                "refresh_token": entry["refresh_token"],
+                "expires_at": entry["expires_at"],
+                "refresh_expires_at": entry["refresh_expires_at"],
+                "token_type": r.get("token_type", ""),
+                "domain": r.get("domain") or entry.get("domain") or "",
+                "uid": entry.get("uid", ""),
+                "nickname": entry.get("nickname", ""),
+                "source": entry.get("source", "oauth"),
+            })
+        return True
+
+    growth_info = ""
+
+    def _run_growth() -> None:
+        nonlocal growth_info
+        try:
+            g = client.growth()
+            if g.get("auth_lost"):
+                growth_info = "成长中心：登录态已失效，请重新扫码登录"
+            elif g.get("steps") or g.get("credited"):
+                growth_info = "成长中心：" + g.get("summary", "")
+        except Exception as e:  # noqa: BLE001
+            growth_info = f"成长中心异常：{type(e).__name__}: {e}"
+
+    def _auth_fail(msg: str) -> str:  # noqa: ARG001
+        return "签到失败：登录态已失效（HTTP 401/403），请重新扫码登录（账号管理 → WorkBuddy → 扫码登录）"
+
+    try:
+        st = client.status()
+        if st.get("http") in (401, 403) and _refresh_once():
+            client = _build()
+            st = client.status()
+        if st.get("http") in (401, 403):
+            result["desc"] = _auth_fail(st.get("message") or "令牌已过期或无权限")
+            return result
+        if st.get("ok") and st.get("today_checked_in"):
+            result["ok"] = True
+            result["desc"] = (f"今日已签到，累计 {st.get('credit')} 积分"
+                              f"（连续第 {st.get('streak_days')} 天）")
+            if growth:
+                _run_growth()
+            if growth_info:
+                result["desc"] += "；" + growth_info
+            return result
+        res = client.checkin()
+        if res.get("http") in (401, 403) and _refresh_once():
+            client = _build()
+            res = client.checkin()
+        if res.get("http") in (401, 403):
+            result["desc"] = _auth_fail(res.get("message") or "令牌已过期或无权限")
+            return result
+        if res.get("ok"):
+            result["ok"] = True
+            result["desc"] = (("今日已签到（幂等）" if res.get("already") else "签到成功")
+                              + f"，累计 {res.get('credit')} 积分"
+                              + f"（连续第 {res.get('streak_days')} 天）")
+            if growth:
+                _run_growth()
+            if growth_info:
+                result["desc"] += "；" + growth_info
+            return result
+        result["desc"] = f"签到失败：{res.get('message')}（HTTP {res.get('http')}）"
+    except WorkBuddyError as e:
+        result["desc"] = f"签到失败：{e}"
+    except Exception as e:  # noqa: BLE001
+        result["desc"] = f"签到失败：{type(e).__name__}: {e}"
+    result["desc"] = _redact(result["desc"])
+    return result
+
+
+def list_accounts_json(config_path: str | None = None) -> str:
+    """多账号脱敏列表（不含 token 明文）。"""
+    entries = load_workbuddy_accounts(config_path)
+    now_ms = int(time.time() * 1000)
+    out = []
+    for e in entries:
+        exp = e["expires_at"]
+        state = ("expired" if exp and exp < now_ms
+                 else "valid" if exp else "unknown")
+        out.append({
+            "name": e["name"],
+            "enabled": e["enabled"],
+            "uid": e["uid"],
+            "nickname": e["nickname"],
+            "source": e["source"],
+            "expires_at": exp,
+            "state": state,
+            "token_mask": mask_token(e["token"]) if e["token"] else "(空)",
+        })
+    return json.dumps({"count": len(out), "accounts": out},
+                      ensure_ascii=False, indent=2)
+
+
+def checkin_all_json(config_path: str | None = None, growth: bool = True) -> tuple:
+    """多账号归并签到，返回 (JSON 字符串, 退出码)。结果与描述均脱敏。"""
+    entries = load_workbuddy_accounts(config_path)
+    results = []
+    for e in entries:
+        if not e["enabled"]:
+            continue
+        if not e["token"]:
+            # 本机登录态回退账号（旧版单账号路径，accounts.json 未存 token）：
+            # 实时读取本机登录态文件签到，保持兼容；本机也无登录态时给出提示。
+            try:
+                e["token"] = _read_token()
+            except WorkBuddyError:
+                results.append({
+                    "name": e["name"],
+                    "source": e["source"],
+                    "ok": False,
+                    "desc": "签到失败：账号无登录态，请先扫码登录（账号管理 → WorkBuddy → 扫码登录）",
+                })
+                continue
+        r = checkin_account(e, config_path=config_path, growth=growth)
+        r["desc"] = _redact(r["desc"])
+        results.append(r)
+    ok = sum(1 for r in results if r["ok"])
+    payload = {
+        "count": len(results),
+        "success": ok,
+        "failed": len(results) - ok,
+        "results": results,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2), (0 if ok == len(results) else 1)
 
 
 class WorkBuddyClient:
@@ -567,13 +947,24 @@ def _probe() -> str:
 
 def main() -> None:
     import argparse
-    parser = argparse.ArgumentParser(description="WorkBuddy 登录态探测 / 签到自检")
+    parser = argparse.ArgumentParser(description="WorkBuddy 登录态探测 / 签到自检 / 多账号管理")
     parser.add_argument("--probe", action="store_true", help="探测本机 WorkBuddy 登录态（输出脱敏 JSON）")
-    parser.add_argument("--credits", action="store_true", help="查询签到状态/积分（自检）")
-    parser.add_argument("--checkin", action="store_true", help="执行签到（自检）")
-    parser.add_argument("--growth", action="store_true", help="执行成长中心六步（自检）")
+    parser.add_argument("--credits", action="store_true", help="查询本机登录态签到状态/积分（自检）")
+    parser.add_argument("--checkin", action="store_true", help="执行本机登录态签到（自检）")
+    parser.add_argument("--growth", action="store_true", help="执行本机登录态成长中心六步（自检）")
+    parser.add_argument("--list-accounts", action="store_true", help="列出 WorkBuddy 多账号（脱敏 JSON）")
+    parser.add_argument("--checkin-all", action="store_true", help="多账号签到（按账号归并输出 JSON，脱敏）")
+    parser.add_argument("--config", default=None, help="accounts.json 路径（默认项目目录）")
+    parser.add_argument("--no-growth", action="store_true", help="--checkin-all 时跳过成长中心")
     args = parser.parse_args()
 
+    if args.list_accounts:
+        print(list_accounts_json(args.config))
+        return
+    if args.checkin_all:
+        text, code = checkin_all_json(args.config, growth=not args.no_growth)
+        print(text)
+        sys.exit(code)
     if args.probe:
         print(_probe())
         return

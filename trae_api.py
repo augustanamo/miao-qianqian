@@ -26,6 +26,45 @@ TIMEOUT = 30
 
 _UA = "TraeCheckin/1.0"
 
+# 鉴权失败的判定口径：
+#   - HTTP 401/403：JWT 本身被拒
+#   - HTTP 200 + 业务码 1001：接口"能通但认不出你"，实测就是 JWT 过期后的典型返回
+#     （日志原文：We're sorry, but we are not able to authenticate you.）
+# 命中任一条即认为 JWT 已失效，用 X-Cloudide-Session 重换一次再试。
+_AUTH_HTTP = (401, 403)
+_AUTH_CODES = (1001, 1002)
+
+# 签到状态接口的字段名各版本不一致，用下面三组 key 做容错匹配
+_CHECKED_KEYS = ("checked_in", "today_checked_in", "has_checked_in",
+                 "is_checked_in", "today_signed", "signed")
+_CREDIT_KEYS = ("checkin_credits", "credits", "credit", "total_credits")
+_STREAK_KEYS = ("continuous_days", "streak_days", "continuous_checkin_days",
+                "continuous_sign_days", "days")
+
+
+def _walk_json(obj):
+    """深度优先遍历 JSON，产出所有 dict 节点（用于字段名容错匹配）。"""
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _walk_json(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_json(v)
+
+
+def _first_value(nodes, keys, predicate):
+    """按 key 的优先级选取字段值。
+
+    外层遍历 keys、内层遍历节点：优先级高的字段名（如 checked_in）在任何深度
+    命中都优先于靠后的宽泛字段名（如 signed），避免深层同名布尔字段抢先命中。
+    """
+    for k in keys:
+        for node in nodes:
+            if k in node and predicate(node[k]):
+                return node[k]
+    return None
+
 
 def random_device_id() -> str:
     """生成 16 位纯数字风控设备号。"""
@@ -52,6 +91,49 @@ class TraeClient:
                 return resp.status, resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode("utf-8", errors="replace")
+
+    def _authed_headers(self, token: str) -> dict:
+        return {
+            "Authorization": "Cloud-IDE-JWT " + token,
+            "X-User-Region": "cn",
+            "x-device-id": self.device_id,
+            "Content-Type": "application/json",
+            "User-Agent": _UA,
+        }
+
+    @staticmethod
+    def _is_auth_failure(status: int, text: str) -> bool:
+        if status in _AUTH_HTTP:
+            return True
+        try:
+            body = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return False
+        if not isinstance(body, dict):
+            return False
+        return body.get("code") in _AUTH_CODES
+
+    def _post_authed(self, path: str, body: str = "{}") -> tuple:
+        """带自动续期的 POST。
+
+        先用手头的 JWT 请求；若被判定为鉴权失败（HTTP 401/403 或业务码 1001），
+        说明 JWT 已过期（约 8 小时），此时用长效的 X-Cloudide-Session
+        重新换取 JWT 并**重试一次**，实现"登录一次、长期免维护"。
+
+        返回 (status, text, refreshed)；refresh 失败时 get_token() 会抛 TraeError
+        （带可读中文提示），由调用方翻译成用户能看懂的失败原因。
+        """
+        token = self.token or self.get_token()
+        status, text = self._post(path, self._authed_headers(token), body)
+        if not self._is_auth_failure(status, text):
+            return status, text, False
+        if not self.session:
+            return status, text, False
+        # 丢弃已失效的 JWT，强制用 session 换一个全新的再重试
+        self.token = ""
+        token = self.get_token()
+        status, text = self._post(path, self._authed_headers(token), body)
+        return status, text, True
 
     # ---------- 换 Token ----------
     def get_token(self) -> str:
@@ -85,21 +167,13 @@ class TraeClient:
     def credits(self) -> dict:
         """查询账号剩余积分（汇总所有资格包剩余额度）。
 
-        先按需用 X-Cloudide-Session 换全新 JWT，再调
-        pay/user_current_entitlement_list 拉取额度包，汇总
-        total(limit - used) 得到剩余积分。返回 dict：
+        调 pay/user_current_entitlement_list 拉取额度包，汇总
+        total(limit - used) 得到剩余积分。JWT 过期会自动用 session 续期重试。
+        返回 dict：
         {ok, http, code, message, remaining, total_limit, total_used, packs, raw}
         """
-        token = self.token or self.get_token()
-        headers = {
-            "Authorization": "Cloud-IDE-JWT " + token,
-            "X-User-Region": "cn",
-            "x-device-id": self.device_id,
-            "Content-Type": "application/json",
-            "User-Agent": _UA,
-        }
-        status, text = self._post(
-            "/trae/api/v2/pay/user_current_entitlement_list", headers, "{}"
+        status, text, refreshed = self._post_authed(
+            "/trae/api/v2/pay/user_current_entitlement_list", "{}"
         )
         try:
             body = json.loads(text)
@@ -115,6 +189,7 @@ class TraeClient:
             "code": code,
             "message": message,
             "ok": False,
+            "refreshed_token": refreshed,
             "remaining": 0.0,
             "total_limit": 0.0,
             "total_used": 0.0,
@@ -174,48 +249,62 @@ class TraeClient:
 
     # ---------- 查询今日签到状态 ----------
     def status(self) -> dict:
-        """查询今日是否已签到。返回 dict；未知字段则尽量容错。"""
-        token = self.token or self.get_token()
-        headers = {
-            "Authorization": "Cloud-IDE-JWT " + token,
-            "X-User-Region": "cn",
-            "x-device-id": self.device_id,
-            "Content-Type": "application/json",
-            "User-Agent": _UA,
-        }
-        status, text = self._post("/trae/api/v2/ug/checkin_credits/status", headers, "{}")
-        try:
-            return {"http": status, "body": json.loads(text)}
-        except json.JSONDecodeError:
-            return {"http": status, "body": {"raw": text}}
+        """查询今日是否已签到（只读，无副作用）。
 
-    # ---------- 执行签到 ----------
-    def checkin(self) -> dict:
-        """执行每日签到。等价的成功条件：HTTP 200 且 code==0 或 checked_in 为真。"""
-        token = self.token or self.get_token()
-        headers = {
-            "Authorization": "Cloud-IDE-JWT " + token,
-            "X-User-Region": "cn",
-            "x-device-id": self.device_id,
-            "Content-Type": "application/json",
-            "User-Agent": _UA,
-        }
-        status, text = self._post("/trae/api/v2/ug/checkin_credits/claim", headers, "{}")
+        该接口字段名随版本变化，这里做容错匹配：在响应树里找
+        checked_in / today_checked_in / ... 这类布尔字段。找到才算
+        known=True，否则 known=False —— 调用方据此决定"是否跳过重复签到"：
+        只有 known 且 checked_in 为真时才跳过，判不出来就照常走签到流程，
+        绝不会因为解析不出字段而漏签。
+
+        返回 dict：{http, body, known, checked_in, credits, streak_days, refreshed_token}
+        """
+        status, text, refreshed = self._post_authed("/trae/api/v2/ug/checkin_credits/status", "{}")
         try:
             body = json.loads(text)
         except json.JSONDecodeError:
             body = {"raw": text}
-        result = {"http": status, "body": body}
+        nodes = list(_walk_json(body))
+        checked = _first_value(nodes, _CHECKED_KEYS, lambda v: isinstance(v, bool))
+        credits = _first_value(nodes, _CREDIT_KEYS, lambda v: isinstance(v, (int, float)) and not isinstance(v, bool))
+        streak = _first_value(nodes, _STREAK_KEYS, lambda v: isinstance(v, (int, float)) and not isinstance(v, bool))
+        known = checked is not None and status == 200
+        return {
+            "http": status,
+            "body": body,
+            "known": known,
+            "checked_in": bool(checked) if known else None,
+            "credits": float(credits) if credits is not None else None,
+            "streak_days": int(streak) if streak is not None else None,
+            "refreshed_token": refreshed,
+        }
+
+    # ---------- 执行签到 ----------
+    def checkin(self) -> dict:
+        """执行每日签到。等价的成功条件：HTTP 200 且 code==0 或 checked_in 为真。
+
+        优先在调用侧用 status() 预检；这里保留"重复签到"的自识别能力作为兜底：
+        返回的 already_checked 表示本次并未真正领取新的奖励。
+        """
+        status, text, refreshed = self._post_authed("/trae/api/v2/ug/checkin_credits/claim", "{}")
+        try:
+            body = json.loads(text)
+        except json.JSONDecodeError:
+            body = {"raw": text}
+        result = {"http": status, "body": body, "refreshed_token": refreshed}
         code = body.get("code", -1)
-        checked_in = body.get("checked_in", False)
+        nodes = list(_walk_json(body))
+        checked_in = _first_value(nodes, _CHECKED_KEYS, lambda v: isinstance(v, bool))
+        checked_bool = bool(checked_in) if isinstance(checked_in, bool) else False
         result["code"] = code
-        result["ok"] = (status == 200) and (code == 0 or checked_in)
+        result["ok"] = (status == 200) and (code == 0 or checked_bool)
         # checked_in 为真但 code!=0，通常是"今天已经签过了"这类已知状态
-        result["already_checked"] = bool(checked_in and code != 0)
+        result["already_checked"] = bool(checked_bool and code != 0)
         result["message"] = body.get("message") or body.get("msg") or (
             "HTTP %d" % status
         )
-        result["credits"] = body.get("credits", 0)
+        credits = _first_value(nodes, _CREDIT_KEYS, lambda v: isinstance(v, (int, float)) and not isinstance(v, bool))
+        result["credits"] = credits if credits is not None else body.get("credits", 0) or 0
         return result
 
 

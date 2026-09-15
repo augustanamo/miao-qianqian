@@ -13,6 +13,7 @@ Trae 内置浏览器登录模块（基于 Playwright）
 
 用法：
     python3 trae_login.py --name trae-1            # 开窗登录
+    python3 trae_login.py                          # 名称留空：按账号 ID 自动命名
     python3 trae_login.py --name trae-2 --timeout 300
     python3 trae_login.py --list                   # 列出已保存的 Trae 账号（脱敏）
 
@@ -154,12 +155,31 @@ def save_trae_account(name: str, session: str, token: str, device_id: str, uid: 
     _log(f"已保存账号「{name}」到 accounts.json")
 
 
+def resolve_trae_name(name: str, uid: str) -> str:
+    """确定最终账号名。
+
+    Trae 的登录态里只有账号 ID（JWT payload 的 data.id），既无昵称字段，
+    trae_api 也不提供用户资料接口，因此名称留空时用账号 ID 后 6 位命名。
+    """
+    name = (name or "").strip()
+    if name:
+        return name
+    if uid:
+        return f"trae-{uid[-6:]}"
+    return "trae-" + datetime.datetime.now().strftime("%m%d%H%M")
+
+
 def run_login(name: str, timeout_seconds: int, enabled: bool = True) -> int:
+    name = name.strip()
+    auto_name = not name
+    if auto_name:
+        _log("未指定账号名称：Trae 登录态不含昵称，将按账号 ID 自动命名。")
+
     os.makedirs(STATE_DIR, exist_ok=True)
-    user_data_dir = os.path.join(STATE_DIR, name)
+    user_data_dir = os.path.join(STATE_DIR, name or "_auto")
     os.makedirs(user_data_dir, exist_ok=True)
 
-    _log(f"正在打开内置浏览器（账号 {name}）…请在弹出的浏览器窗口中登录 Trae。")
+    _log(f"正在打开内置浏览器（账号 {name or '（自动命名）'}）…请在弹出的浏览器窗口中登录 Trae。")
     _log("登录成功后本程序会自动识别并保存，无需手动操作。")
     _log("提示：登录期间可自由切换标签页/填写验证码，脚本会持续监控。")
     _log("若页面未自动跳转到登录页，可手动访问以下任一地址：")
@@ -235,9 +255,13 @@ def run_login(name: str, timeout_seconds: int, enabled: bool = True) -> int:
             _log(f"JWT 换取失败（{e}），将仅保存长效会话 Cookie，token 暂为空。")
 
     uid = parse_account_uid(token) if token else ""
-    save_trae_account(name, session, token, device_id, uid, enabled=enabled)
+    final_name = resolve_trae_name(name, uid)
+    if auto_name:
+        _log(f"已自动命名账号：{final_name}"
+             + ("" if uid else "（未能取到账号 ID，改用时间戳命名）"))
+    save_trae_account(final_name, session, token, device_id, uid, enabled=enabled)
     _log(f"登录完成：session={mask(session)} device_id={device_id} uid={uid or '(未知)'}")
-    _log("下一步：运行  python3 checkin.py --only %s  验证签到。" % name)
+    _log("下一步：运行  python3 checkin.py --only %s  验证签到。" % final_name)
     return 0
 
 
@@ -257,7 +281,8 @@ def run_list() -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Trae 内置浏览器登录")
-    parser.add_argument("--name", help="账号名称（唯一），如 trae-1")
+    parser.add_argument("--name", default="",
+                        help="账号名称（唯一），如 trae-1；留空时按账号 ID 自动命名")
     parser.add_argument("--timeout", type=int, default=600, help="等待登录超时秒数，默认 600")
     parser.add_argument("--enabled", type=int, default=1, choices=[0, 1],
                         help="新增账号是否加入自动签到（1=开启，0=关闭，默认开启；仅新建账号时生效）")
@@ -266,8 +291,6 @@ def main() -> int:
 
     if args.list:
         return run_list()
-    if not args.name:
-        parser.error("需要 --name（账号名称），或用 --list 查看已有账号")
 
     return run_login(args.name, args.timeout, enabled=bool(args.enabled))
 

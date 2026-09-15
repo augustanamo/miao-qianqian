@@ -104,7 +104,7 @@ else
   fi
 fi
 
-# 平台真实图标（Trae / WorkBuddy）：账号列表与签到表格的头像用。
+# 平台真实图标（Trae / WorkBuddy / Bilibili / 联想智选 / 京东）：账号列表与签到表格的头像用。
 # 取不到的平台会自动回退为首字方块，缺图不影响运行。
 if [ -d "$TOOL_DIR/assets/platform-icons" ]; then
   icon_n=0

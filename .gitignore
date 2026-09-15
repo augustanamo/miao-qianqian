@@ -12,6 +12,7 @@ accounts.json
 .env.*
 # Playwright 持久化浏览器上下文（含网页登录态 cookie）
 .browser_state/
+.browser_state_cookie/
 
 # ---- 运行时产物与日志 ----
 # 签到/launchd 日志

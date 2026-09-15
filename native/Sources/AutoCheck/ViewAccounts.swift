@@ -72,13 +72,13 @@ struct AccountsView: View {
                 }
                 .frame(maxWidth: .infinity)
 
-                VStack(spacing: 17) {
-                    if m.showingAddPanel {
-                        AddAccountPanel()
-                    }
-                    summaryCard
+                // 右侧栏只承载「新增账号」面板。面板收起时整栏不再占位，
+                // 列表随之铺满整宽 —— 原来的「签到状态摘要」卡已按要求移除
+                // （签到进度属于签到页，与账号管理无关）。
+                if m.showingAddPanel {
+                    AddAccountPanel()
+                        .frame(width: 358)
                 }
-                .frame(width: 358)
             }
         }
         .background(Theme.pageBG)
@@ -216,72 +216,6 @@ struct AccountsView: View {
         }
     }
 
-    // MARK: 签到状态摘要
-    private var summaryCard: some View {
-        let all = m.accounts
-        var done = 0, failCount = 0, pendingCount = 0, disabled = 0
-        for acc in all {
-            if !acc.isEnabled { disabled += 1; continue }
-            switch m.accStatus(acc.name).state {
-            case "done": done += 1
-            case "fail": failCount += 1
-            default: pendingCount += 1
-            }
-        }
-        let total = all.count
-        let ratio = total > 0 ? Double(done) / Double(total) : 0
-
-        return Card {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 8) {
-                    Text("签到状态摘要")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundColor(Theme.text)
-                    Spacer(minLength: 8)
-                    Text("今天").font(.system(size: 11.5)).foregroundColor(Theme.textSub)
-                }
-
-                HStack(spacing: 8) {
-                    Text("今日已完成 \(done) / \(total) 个账号")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(Theme.text)
-                    Spacer(minLength: 8)
-                    SoftTag(text: "\(Int(ratio * 100))%", fg: Theme.success, bg: Theme.successSoft)
-                }
-                .padding(.top, 18)
-
-                ProgressBar(value: ratio, height: 8, fill: Theme.success)
-                    .padding(.top, 12)
-
-                VStack(spacing: 0) {
-                    summaryRow(Theme.success, "已完成", "\(done) 个账号")
-                    summaryRow(Theme.neutral, "待签到", "\(pendingCount) 个账号")
-                    summaryRow(Theme.accent, "签到失败", "\(failCount) 个账号")
-                    if disabled > 0 { summaryRow(Theme.neutral, "已停用", "\(disabled) 个账号") }
-                }
-                .padding(.top, 14)
-
-                Divider().overlay(Theme.hairline).padding(.top, 4)
-
-                Text("失败账号会在下次定时任务中自动重试，也可在列表中手动重试。")
-                    .font(.system(size: 11.5))
-                    .foregroundColor(Theme.textSub)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.top, 12)
-            }
-        }
-    }
-
-    private func summaryRow(_ color: Color, _ title: String, _ value: String) -> some View {
-        HStack(spacing: 7) {
-            Dot(color: color, size: 7)
-            Text(title).font(.system(size: 13)).foregroundColor(Theme.textBody)
-            Spacer(minLength: 8)
-            Text(value).font(.system(size: 13, weight: .medium)).foregroundColor(Theme.textBody)
-        }
-        .frame(height: 32)
-    }
-
     private func filteredAccounts() -> [Account] {
         var list = m.accounts
         if !search.isEmpty {
@@ -306,12 +240,15 @@ struct AccountsView: View {
         return list
     }
 
-    /// 按平台分组：Trae → WorkBuddy → 其他平台（组内按账号名排序）。
+    /// 按平台分组：Trae → WorkBuddy → Bilibili → 联想智选 → 京东 → 其他平台（组内按账号名排序）。
     /// 分组键复用 `Account.platformIconName`，保证分组与头像图标同源，不会各写一套判断。
     private func groupedAccounts(_ rows: [Account]) -> [AccountGroup] {
         let buckets = [
             AccountGroup(id: "trae", title: "Trae", iconName: "trae", accounts: []),
             AccountGroup(id: "workbuddy", title: "WorkBuddy", iconName: "workbuddy", accounts: []),
+            AccountGroup(id: "bilibili", title: "Bilibili", iconName: "bilibili", accounts: []),
+            AccountGroup(id: "lenovo", title: "联想智选", iconName: "lenovo", accounts: []),
+            AccountGroup(id: "jd", title: "京东", iconName: "jd", accounts: []),
             AccountGroup(id: "other", title: "其他平台", iconName: nil, accounts: []),
         ]
         return buckets.compactMap { bucket in
@@ -366,8 +303,11 @@ struct AccountsView: View {
         if enabled.isEmpty { return "全部已停用" }
         let done = enabled.filter { m.accStatus($0.name).state == "done" }.count
         let fail = enabled.filter { m.accStatus($0.name).state == "fail" }.count
-        if fail > 0 { return "\(done)/\(enabled.count) 已完成 · \(fail) 个失败" }
-        return "\(done)/\(enabled.count) 已完成"
+        let restricted = enabled.filter { m.accStatus($0.name).state == "restricted" }.count
+        var parts = ["\(done)/\(enabled.count) 已完成"]
+        if restricted > 0 { parts.append("\(restricted) 个平台受限") }
+        if fail > 0 { parts.append("\(fail) 个失败") }
+        return parts.joined(separator: " · ")
     }
 }
 
@@ -478,12 +418,18 @@ struct AccountRowView: View {
         if !acc.isEnabled { return Theme.textSub }
         switch state {
         case "fail": return Theme.accent
+        case "restricted": return Theme.warn
         case "done": return Theme.text
         default: return Theme.textSub
         }
     }
     private var avatarBG: Color {
-        (acc.isEnabled && state == "fail") ? Theme.accentSoft : Theme.chipBG
+        if !acc.isEnabled { return Theme.chipBG }
+        switch state {
+        case "fail": return Theme.accentSoft
+        case "restricted": return Theme.warnSoft
+        default: return Theme.chipBG
+        }
     }
 
     @ViewBuilder
@@ -495,8 +441,12 @@ struct AccountRowView: View {
             Text("·").font(.system(size: 11.5)).foregroundColor(Theme.textFaint)
             if !acc.isEnabled {
                 Text("已暂停自动签到").font(.system(size: 11.5)).foregroundColor(Theme.textSub)
-            } else if st.state == "fail", let hit = st.hit, !hit.msg.isEmpty {
-                Text(hit.msg).font(.system(size: 11.5)).foregroundColor(Theme.accent).lineLimit(1)
+            } else if (st.state == "fail" || st.state == "restricted"), let hit = st.hit, !hit.msg.isEmpty {
+                // 受限也把原因摆出来（"京东侧限制：…"），避免用户以为是自己的 cookie 坏了
+                Text(hit.msg)
+                    .font(.system(size: 11.5))
+                    .foregroundColor(st.state == "restricted" ? Theme.warn : Theme.accent)
+                    .lineLimit(1)
             } else {
                 Text("连续 \(streak) 天").font(.system(size: 11.5)).foregroundColor(Theme.textSub)
             }
@@ -511,6 +461,7 @@ struct AccountRowView: View {
             switch state {
             case "done": StatusPill(text: "已完成", color: Theme.success, bg: Theme.successSoft)
             case "fail": StatusPill(text: "签到失败", color: Theme.accent, bg: Theme.accentSoft)
+            case "restricted": StatusPill(text: "平台受限", color: Theme.warn, bg: Theme.warnSoft)
             default:     StatusPill(text: "待签到", color: Theme.neutral, bg: Theme.chipBG)
             }
         }
@@ -536,15 +487,11 @@ struct AccountRowView: View {
 // MARK: - 新增账号面板
 struct AddAccountPanel: View {
     @EnvironmentObject var m: AppModel
-    @State private var mode = 0                 // 0 Trae 登录 / 1 凭据导入 / 2 WorkBuddy
     @State private var name: String = ""
-    @State private var app: String = "trae"
-    @State private var platIdx = 0
-    @State private var curl: String = ""
+    @State private var browserIdx = 0           // 「浏览器登录」的平台选择（Trae + Cookie 型平台）
+    @State private var platOpen = false         // 平台下拉是否展开（popover）
+    @State private var cookie: String = ""
     @State private var autoEnable = true
-    @State private var savingCurl = false
-
-    private let platforms = ["TRAE", "WORKBUDDY", "CURL", "其他"]
 
     var body: some View {
         Card {
@@ -561,14 +508,8 @@ struct AddAccountPanel: View {
                     .foregroundColor(Theme.textSub)
                 }
 
-                SegmentedControl(items: [.init(0, "Trae 登录"), .init(1, "凭据导入"), .init(2, "WorkBuddy")],
-                                 selection: $mode)
-                    .padding(.top, 14)
-
-                Group {
-                    if mode == 0 { traeForm } else if mode == 1 { curlForm } else { workbuddyForm }
-                }
-                .padding(.top, 16)
+                browserForm
+                    .padding(.top, 16)
             }
         }
     }
@@ -577,97 +518,218 @@ struct AddAccountPanel: View {
         FormLabel(text: t).frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var traeForm: some View {
-        VStack(alignment: .leading, spacing: 14) {
+    /// 浏览器登录：WorkBuddy 扫码 / Trae / Cookie 型平台对用户是同一个动作
+    /// （弹出内置浏览器 → 登录 → 抓登录态），故合并成一个入口，用平台下拉切换。
+    /// 账号名称可留空：脚本会读登录结果自动命名（昵称 → 账号 ID → auto）。
+    private var browserForm: some View {
+        let cur = browserOptions[browserIdx]
+        return VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 7) {
-                label("账号名称")
+                label("平台")
+                // 用 Button + popover，而不是 Menu：
+                // SwiftUI 的 Menu 标签会忽略内容里的 .frame()，里面的平台图标会按
+                // NSImage 的自然点尺寸绘制（最大 512pt），把整个面板撑爆、顺带把
+                // 左侧账号列表挤到裁切。Button 的标签正常遵守 frame（实测 89×32，
+                // 与设计稿一致），图标能稳稳待在 14pt。
+                Button { platOpen.toggle() } label: {
+                    SelectBox {
+                        HStack(spacing: 7) {
+                            platformGlyph(cur, size: 14)
+                            Text(cur.label).font(.system(size: 13)).foregroundColor(Theme.text)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                .popover(isPresented: $platOpen, arrowEdge: .bottom) { platformMenu }
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                label("账号名称（可不填）")
                 FieldBox {
-                    TextField("如：trae-main", text: $name)
+                    TextField(cur.placeholder, text: $name)
                         .textFieldStyle(.plain).font(.system(size: 13)).foregroundColor(Theme.inputText)
                 }
             }
+
             HStack(spacing: 8) {
                 Text("加入自动签到").font(.system(size: 13)).foregroundColor(Theme.textBody)
                 Spacer(minLength: 8)
                 GreenSwitch(isOn: $autoEnable)
             }
-            Button { m.runTraeLogin(name: name, enabled: autoEnable) } label: {
+
+            Button {
+                switch cur.kind {
+                case .workbuddy:
+                    m.runWorkBuddyOAuth(name: name, enabled: autoEnable)
+                case .trae:
+                    m.runTraeLogin(name: name, enabled: autoEnable)
+                case .cookie:
+                    m.runCookieBrowserLogin(type: cur.type, name: name, enabled: autoEnable)
+                }
+            } label: {
                 Label(m.loginRunning ? "正在等待登录完成…" : "打开登录浏览器", systemImage: "globe")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(PrimaryButtonStyle())
-            .disabled(m.loginRunning || name.trimmingCharacters(in: .whitespaces).isEmpty)
+            .disabled(m.loginRunning)
 
-            Text("将弹出内置浏览器窗口，登录后程序自动识别并保存登录态（约 14 天有效）。")
+            Text(cur.hint)
                 .font(.system(size: 11.5)).foregroundColor(Theme.textSub)
                 .fixedSize(horizontal: false, vertical: true)
+
+            // 平台专属的次级路径（都不弹浏览器）：
+            //   WorkBuddy -> 直接读本机桌面端登录态
+            //   Cookie 型 -> 手动粘贴 Cookie
+            //   Trae      -> 无（Trae 只有浏览器登录一条路）
+            switch cur.kind {
+            case .workbuddy:
+                workbuddyLocalSection
+            case .cookie:
+                manualCookieSection(cur)
+            case .trae:
+                EmptyView()
+            }
         }
     }
 
-    private var curlForm: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 7) {
-                label("账号 / 邮箱")
-                FieldBox {
-                    TextField("如：user@mail.com", text: $name)
-                        .textFieldStyle(.plain).font(.system(size: 13)).foregroundColor(Theme.inputText)
-                }
-            }
-            VStack(alignment: .leading, spacing: 7) {
-                label("平台")
-                Menu {
-                    ForEach(platforms, id: \.self) { p in
-                        Button(p) { app = p.lowercased(); platIdx = platforms.firstIndex(of: p) ?? 0 }
-                    }
-                } label: {
-                    SelectBox {
-                        Text(platforms[platIdx]).font(.system(size: 13)).foregroundColor(Theme.text)
-                    }
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-            }
-            VStack(alignment: .leading, spacing: 7) {
-                label("登录凭据（Cookie / Token）")
-                TextEditor(text: $curl)
-                    .font(.system(size: 11.5, design: .monospaced))
-                    .foregroundColor(Theme.inputText)
-                    .scrollContentBackground(.hidden)
-                    .padding(8)
-                    .frame(height: 92)
-                    .background(Color.white)
-                    .clipShape(RoundedRectangle(cornerRadius: Theme.ctrlCorner, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: Theme.ctrlCorner, style: .continuous)
-                        .stroke(Theme.border, lineWidth: 1))
-            }
-            HStack(spacing: 8) {
-                Text("加入自动签到").font(.system(size: 13)).foregroundColor(Theme.textBody)
-                Spacer(minLength: 8)
-                GreenSwitch(isOn: $autoEnable)
-            }
-            HStack(spacing: 10) {
-                Spacer(minLength: 0)
-                Button("取消") { m.showingAddPanel = false }
-                    .buttonStyle(GhostButtonStyle())
+    /// 平台角标：有真实图标用图标，否则回退 SF Symbol
+    @ViewBuilder
+    private func platformGlyph(_ o: BrowserOption, size: CGFloat) -> some View {
+        if let img = PlatformIcon.image(o.iconName) {
+            Image(nsImage: img)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: size, height: size)
+                .clipShape(RoundedRectangle(cornerRadius: size * 0.25, style: .continuous))
+        } else {
+            Image(systemName: o.symbol)
+                .font(.system(size: size * 0.72))
+                .foregroundColor(Theme.textSub)
+                .frame(width: size, height: size)
+        }
+    }
+
+    /// 平台下拉的内容（popover）。用 Button 实现，避免 Menu 标签忽略 .frame() 的问题。
+    private var platformMenu: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            ForEach(Array(browserOptions.enumerated()), id: \.element.type) { i, p in
                 Button {
-                    savingCurl = true
-                    m.addAccountCurl(name: name, app: app, curl: curl, enabled: autoEnable) { _ in savingCurl = false }
+                    browserIdx = i
+                    platOpen = false
                 } label: {
-                    Label("保存并验证", systemImage: "checkmark")
+                    HStack(spacing: 8) {
+                        platformGlyph(p, size: 14)
+                        Text(p.label)
+                            .font(.system(size: 12.5))
+                            .foregroundColor(Theme.text)
+                        Spacer(minLength: 18)
+                        if i == browserIdx {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(Theme.success)
+                        }
+                    }
+                    .padding(.horizontal, 9)
+                    .frame(height: 26)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
                 }
-                .buttonStyle(PrimaryButtonStyle())
-                .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty
-                          || curl.trimmingCharacters(in: .whitespaces).isEmpty || savingCurl)
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(5)
+        .frame(width: 188)
+    }
+
+    /// Cookie 型平台的「或手动粘贴 Cookie」次级路径
+    @ViewBuilder
+    private func manualCookieSection(_ cur: BrowserOption) -> some View {
+        Divider().overlay(Theme.hairline).padding(.vertical, 2)
+        VStack(alignment: .leading, spacing: 10) {
+            Text("或手动粘贴 Cookie")
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundColor(Theme.text)
+            TextEditor(text: $cookie)
+                .font(.system(size: 11.5, design: .monospaced))
+                .foregroundColor(Theme.inputText)
+                .scrollContentBackground(.hidden)
+                .padding(8)
+                .frame(height: 88)
+                .background(Color.white)
+                .clipShape(RoundedRectangle(cornerRadius: Theme.ctrlCorner, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: Theme.ctrlCorner, style: .continuous)
+                    .stroke(Theme.border, lineWidth: 1))
+            HStack(spacing: 10) {
+                Text("同名提交会覆盖更新，用于换号/续期。")
+                    .font(.system(size: 11.5)).foregroundColor(Theme.textSub)
+                Spacer(minLength: 8)
+                Button {
+                    m.addCookieAccount(type: cur.type, name: name, cookie: cookie, enabled: autoEnable) { ok in
+                        if ok { cookie = ""; name = "" }
+                    }
+                } label: {
+                    Label("手动粘贴保存", systemImage: "checkmark")
+                }
+                .buttonStyle(GhostButtonStyle())
+                .disabled(m.loginRunning
+                          || name.trimmingCharacters(in: .whitespaces).isEmpty
+                          || cookie.trimmingCharacters(in: .whitespaces).isEmpty)
             }
         }
     }
 
-    private var workbuddyForm: some View {
-        VStack(alignment: .leading, spacing: 14) {
+    /// 「浏览器登录」的平台列表：WorkBuddy 扫码 / Trae / Cookie 型平台
+    private var browserOptions: [BrowserOption] {        var list: [BrowserOption] = [
+            BrowserOption(type: "workbuddy", label: "WorkBuddy", iconName: "workbuddy",
+                          symbol: "qrcode.viewfinder",
+                          placeholder: "留空则自动读取账号昵称",
+                          hint: "将弹出内置浏览器打开授权页，扫码后自动换取并保存登录态；"
+                              + "token 等同密码，仅本机存储。名称留空时自动以昵称命名。",
+                          kind: .workbuddy),
+            BrowserOption(type: "trae", label: "Trae", iconName: "trae",
+                          symbol: "chevron.left.forwardslash.chevron.right",
+                          placeholder: "留空则按账号 ID 自动命名",
+                          hint: "将弹出内置浏览器窗口，登录后程序自动识别并保存登录态（约 14 天有效）。"
+                              + "Trae 登录态不含昵称，名称留空时按账号 ID 命名。",
+                          kind: .trae),
+        ]
+        for p in AppModel.cookiePlatforms {
+            let extra = p.type == "lenovo"
+                ? "联想智选也可在终端执行 python3 lenovo.py --login-account --name <账号名> 走账密登录。"
+                : ""
+            list.append(BrowserOption(type: p.type, label: p.label, iconName: p.type,
+                                      symbol: cookieSymbol(p.type),
+                                      placeholder: "留空则自动读取账号昵称",
+                                      hint: "将弹出内置浏览器，扫码或账密登录后自动抓取 Cookie 并保存；"
+                                          + "Cookie 等同密码，仅本机存储，列表/日志只显示脱敏摘要；"
+                                          + "名称留空时自动以昵称命名。" + extra,
+                                      kind: .cookie))
+        }
+        return list
+    }
+
+    private func cookieSymbol(_ type: String) -> String {
+        switch type {
+        case "bilibili": return "play.rectangle"
+        case "lenovo": return "laptopcomputer"
+        case "jd": return "cart"
+        default: return "globe"
+        }
+    }
+
+    /// WorkBuddy 的次级路径：直接读取本机桌面端已登录的账号，不弹浏览器。
+    private var workbuddyLocalSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Divider().overlay(Theme.hairline).padding(.vertical, 2)
+
+            Text("或读取本机桌面端登录态")
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundColor(Theme.text)
+
             HStack(spacing: 8) {
                 Dot(color: wbColor, size: 8)
-                Text(wbText).font(.system(size: 12.5)).foregroundColor(wbColor == Theme.accent ? Theme.accent : Theme.textBody)
+                Text(wbText).font(.system(size: 12.5))
+                    .foregroundColor(wbColor == Theme.accent ? Theme.accent : Theme.textBody)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
             }
@@ -675,18 +737,6 @@ struct AddAccountPanel: View {
             .background(wbColor.opacity(0.08))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-            VStack(alignment: .leading, spacing: 7) {
-                label("账号名称（可选，留空自动以昵称命名）")
-                FieldBox {
-                    TextField("如：workbuddy", text: $name)
-                        .textFieldStyle(.plain).font(.system(size: 13)).foregroundColor(Theme.inputText)
-                }
-            }
-            HStack(spacing: 8) {
-                Text("加入自动签到").font(.system(size: 13)).foregroundColor(Theme.textBody)
-                Spacer(minLength: 8)
-                GreenSwitch(isOn: $autoEnable)
-            }
             HStack(spacing: 10) {
                 Spacer(minLength: 0)
                 Button { m.probeWorkBuddy() } label: { Image(systemName: "arrow.clockwise") }
@@ -695,12 +745,16 @@ struct AddAccountPanel: View {
                 Button {
                     m.addWorkBuddyAccount(name: name, enabled: autoEnable)
                 } label: {
-                    Label(m.loginRunning ? "正在读取…" : "读取并添加", systemImage: "person.crop.circle.badge.plus")
+                    Label(m.loginRunning ? "正在读取…" : "读取本机登录态并添加",
+                          systemImage: "person.crop.circle.badge.plus")
                 }
-                .buttonStyle(PrimaryButtonStyle())
+                .buttonStyle(GhostButtonStyle())
                 .disabled(m.loginRunning || m.wbHealthy != true)
             }
-            Text("凭据安全：accessToken 等同账号密码，仅在本机内存中使用，不写入配置文件、不写日志、不回显。")
+
+            Text("读取桌面端当前已登录的账号（不弹浏览器）；名称留空时自动用本机昵称命名。"
+                 + "凭据安全：accessToken/refreshToken 等同账号密码，仅写入 accounts.json（.gitignore 排除），"
+                 + "不写日志、不在界面回显明文。")
                 .font(.system(size: 11.5)).foregroundColor(Theme.textSub)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -720,4 +774,23 @@ struct AddAccountPanel: View {
         default: return "正在检测本机 WorkBuddy 登录态…"
         }
     }
+
+}
+
+/// 登录方式：三个平台各有自己的底层脚本，但对用户是同一个动作
+/// （弹出内置浏览器 → 登录 → 抓登录态），所以共用一套 UI、用平台下拉切换。
+///   - workbuddy -> workbuddy_login.py（OAuth device flow 扫码）
+///   - trae      -> trae_login.py（抓 localStorage token + 长效会话 Cookie）
+///   - cookie    -> browser_login.py（抓平台 Cookie）
+private enum LoginKind { case workbuddy, trae, cookie }
+
+/// 「浏览器登录」的平台选项
+private struct BrowserOption {
+    let type: String
+    let label: String
+    let iconName: String?
+    let symbol: String
+    let placeholder: String
+    let hint: String
+    let kind: LoginKind
 }

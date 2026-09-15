@@ -184,17 +184,21 @@ struct SidebarView: View {
         return Button {
             m.selectedPage = page
         } label: {
-            HStack(spacing: 11) {
+            HStack(spacing: 0) {
+                Text(String(format: "%02d", page.number))
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundColor(on ? Theme.accent : Theme.sidebarDim)
+                    .frame(width: 26, alignment: .leading)
                 Image(systemName: icons[page] ?? "circle")
                     .font(.system(size: 13.5, weight: .regular))
                     .foregroundColor(on ? Theme.sidebarIcon : Theme.sidebarText)
-                    .frame(width: 20, alignment: .center)
+                    .frame(width: 22, alignment: .center)
                 Text(page.rawValue)
                     .font(.system(size: 13.5, weight: on ? .semibold : .regular))
                     .foregroundColor(on ? .white : Theme.sidebarText)
                 Spacer(minLength: 0)
             }
-            .padding(.leading, 14)
+            .padding(.leading, 12)
             .frame(height: 40)
             .frame(maxWidth: .infinity)
             .background(on ? Theme.sidebarCard : Color.clear)
@@ -219,7 +223,8 @@ struct SidebarView: View {
             }
             ProgressBar(value: ratio, height: 6, fill: Theme.success, track: Theme.sidebarTrack)
                 .padding(.top, 13)
-            Text(sum.pending > 0 ? "还有 \(sum.pending) 个账号待签到" : "全部账号已处理")
+            Text(sum.pending > 0 ? "还有 \(sum.pending) 个账号待签到"
+                 : (sum.restricted > 0 ? "\(sum.restricted) 个账号平台受限" : "全部账号已处理"))
                 .font(.system(size: 11))
                 .foregroundColor(Theme.sidebarLabel)
                 .padding(.top, 14)
@@ -364,6 +369,7 @@ struct CheckinView: View {
     var body: some View {
         PageScroll {
             let sum = m.todaySummary()
+            // 「手动签到」按钮只在顶栏保留一处，页面内不再重复放一个
             PageHeader("今日签到", subtitle: headerSubtitle) {
                 Button {
                     m.refreshAll(loadCredits: true)
@@ -372,21 +378,6 @@ struct CheckinView: View {
                     Label("刷新数据", systemImage: "arrow.clockwise")
                 }
                 .buttonStyle(GhostButtonStyle())
-
-                Button { m.runSign() } label: {
-                    HStack(spacing: 6) {
-                        if m.signRunning {
-                            ProgressView().controlSize(.small).scaleEffect(0.7).frame(width: 12, height: 12)
-                            Text("签到中")
-                        } else {
-                            Image(systemName: "bolt.fill").font(.system(size: 11))
-                            Text("手动签到")
-                        }
-                    }
-                    .frame(minWidth: 74)
-                }
-                .buttonStyle(PrimaryButtonStyle())
-                .disabled(m.signRunning)
             }
 
             HStack(alignment: .top, spacing: 26) {
@@ -418,7 +409,7 @@ struct CheckinView: View {
 // 深色战绩卡
 struct CheckinHeroCard: View {
     @EnvironmentObject var m: AppModel
-    let sum: (done: Int, fail: Int, pending: Int, credit: Double, total: Int)
+    let sum: (done: Int, fail: Int, pending: Int, credit: Double, total: Int, restricted: Int)
 
     var body: some View {
         Card(padding: nil, color: Theme.sidebar, bordered: false) {
@@ -452,12 +443,20 @@ struct CheckinHeroCard: View {
                     .foregroundColor(Theme.darkCaption)
                     .padding(.top, 4)
 
+                // 「平台受限」不计入失败：账号和 cookie 都是好的，是对方活动下线/风控。
+                if sum.restricted > 0 {
+                    Text("\(sum.restricted) 个账号平台受限（活动下线 / 风控，非失败）")
+                        .font(.system(size: 12))
+                        .foregroundColor(Theme.warn)
+                        .padding(.top, 6)
+                }
+
                 ProgressBar(value: ratio, height: 8, fill: Theme.success, track: Theme.sidebarTrack)
                     .padding(.top, 12)
 
                 HStack(alignment: .top, spacing: 46) {
                     metric(Fmt.signed(sum.credit), "今日获得积分", .white)
-                    metric(Fmt.group(m.totalRemainingCredits()), "累计积分", .white)
+                    metric(Fmt.group(m.totalCredits()), "账号积分总额", .white)
                     metric("\(m.overallStreak()) 天", "连续签到", Theme.success)
                     Spacer(minLength: 0)
                 }
@@ -480,10 +479,14 @@ struct CheckinHeroCard: View {
     }
 }
 
-// 积分状态卡
+// 积分状态卡：大数字是**所有启用账号的余额合计**，下方按账号给出明细。
+// 各平台单位不同（积分 / 硬币 / 乐豆），明细里标明单位，合计按"点数总和"理解。
 struct CreditCard: View {
     @EnvironmentObject var m: AppModel
     @Binding var chartDays: Int
+
+    private static let cols = [GridItem(.flexible(), alignment: .leading),
+                               GridItem(.flexible(), alignment: .leading)]
 
     var body: some View {
         Card {
@@ -494,10 +497,10 @@ struct CreditCard: View {
 
                 HStack(alignment: .bottom, spacing: 16) {
                     VStack(alignment: .leading, spacing: 0) {
-                        Text(Fmt.group(m.totalRemainingCredits()))
+                        Text(Fmt.group(m.totalCredits()))
                             .font(.system(size: 28, weight: .bold))
                             .foregroundColor(Theme.text)
-                        Text("累计积分总额")
+                        Text("账号积分总额")
                             .font(.system(size: 11.5))
                             .foregroundColor(Theme.textSub)
                             .padding(.top, 4)
@@ -511,8 +514,71 @@ struct CreditCard: View {
                     Spacer(minLength: 0)
                 }
                 .padding(.top, 16)
+
+                breakdown.padding(.top, 18)
             }
         }
+    }
+
+    /// 逐账号余额明细 —— 让"总额"可核对，也能一眼看出哪个账号查不到余额
+    @ViewBuilder
+    private var breakdown: some View {
+        let rows = m.enabledAccounts()
+        if !rows.isEmpty {
+            let cov = m.creditsCoverage()
+            Divider().overlay(Theme.hairline)
+
+            HStack(spacing: 8) {
+                Text("分账号余额")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundColor(Theme.textSub)
+                Spacer(minLength: 8)
+                Text(cov.counted == 0 ? "尚未查询到余额" : "\(cov.counted) / \(cov.total) 个账号有余额")
+                    .font(.system(size: 11))
+                    .foregroundColor(Theme.textSub)
+            }
+            .padding(.top, 12)
+            .padding(.bottom, 6)
+
+            LazyVGrid(columns: CreditCard.cols, spacing: 0) {
+                ForEach(rows) { acc in
+                    HStack(spacing: 8) {
+                        PlatformAvatar(text: String(acc.platformLabel.prefix(1)),
+                                       tint: Theme.textSub, bg: Theme.chipBG,
+                                       size: 18, iconName: acc.platformIconName,
+                                       dimmed: !acc.isEnabled)
+                        Text(acc.name)
+                            .font(.system(size: 12.5))
+                            .foregroundColor(Theme.textBody)
+                            .lineLimit(1)
+                        Spacer(minLength: 6)
+                        Text(balanceText(acc))
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundColor(balanceColor(acc))
+                            .lineLimit(1)
+                    }
+                    .frame(height: 28)
+                }
+            }
+
+            Text("各平台单位不同（积分 / 硬币 / 乐豆），上方总额按点数相加。")
+                .font(.system(size: 11))
+                .foregroundColor(Theme.textFaint)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.top, 8)
+        }
+    }
+
+    private func balanceText(_ acc: Account) -> String {
+        guard let c = m.creditsByAccount[acc.name] else { return "—" }
+        if let b = c.balance { return "\(Fmt.group(b)) \(c.unit)" }
+        return c.ok ? "未提供" : "查询失败"
+    }
+
+    private func balanceColor(_ acc: Account) -> Color {
+        guard let c = m.creditsByAccount[acc.name] else { return Theme.textFaint }
+        if c.balance != nil { return Theme.text }
+        return c.ok ? Theme.textSub : Theme.accent
     }
 }
 
@@ -664,7 +730,7 @@ struct TaskRow: View {
             HStack(spacing: 11) {
                 PlatformAvatar(text: letter,
                                tint: acc.isEnabled ? avatarTint(st.state) : Theme.textSub,
-                               bg: (acc.isEnabled && st.state == "fail") ? Theme.accentSoft : Theme.chipBG,
+                               bg: avatarBG(st.state),
                                iconName: acc.platformIconName,
                                dimmed: !acc.isEnabled)
                 VStack(alignment: .leading, spacing: 3) {
@@ -684,10 +750,10 @@ struct TaskRow: View {
 
             Text(creditText(st))
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundColor(st.state == "done" && acc.isEnabled ? Theme.success : Theme.textSub)
+                .foregroundColor(creditColor(st))
                 .frame(width: creditW, alignment: .leading)
 
-            statusPill(st.state).frame(width: statusW, alignment: .leading)
+            statusPill(st).frame(width: statusW, alignment: .leading)
 
             actionView(st.state).frame(width: actionW, alignment: .leading)
         }
@@ -705,8 +771,19 @@ struct TaskRow: View {
     private func avatarTint(_ state: String) -> Color {
         switch state {
         case "fail": return Theme.accent
+        case "restricted": return Theme.warn
         case "done": return Theme.text
         default: return Theme.textSub
+        }
+    }
+
+    /// 头像底色：失败红、平台受限橙、其余中性。
+    private func avatarBG(_ state: String) -> Color {
+        guard acc.isEnabled else { return Theme.chipBG }
+        switch state {
+        case "fail": return Theme.accentSoft
+        case "restricted": return Theme.warnSoft
+        default: return Theme.chipBG
         }
     }
 
@@ -722,10 +799,11 @@ struct TaskRow: View {
                 Text("已暂停自动签到")
                     .font(.system(size: 11.5))
                     .foregroundColor(Theme.textSub)
-            } else if st.state == "fail", let hit = st.hit {
-                Text(hit.msg.isEmpty ? "签到失败" : hit.msg)
+            } else if (st.state == "fail" || st.state == "restricted"), let hit = st.hit {
+                // 平台受限也把原因显示出来（橙色），让人一眼看出不是自己账号的问题
+                Text(hit.msg.isEmpty ? (st.state == "restricted" ? "平台受限" : "签到失败") : hit.msg)
                     .font(.system(size: 11.5))
-                    .foregroundColor(Theme.accent)
+                    .foregroundColor(st.state == "restricted" ? Theme.warn : Theme.accent)
                     .lineLimit(1)
             } else {
                 Text("连续 \(streak) 天")
@@ -737,7 +815,14 @@ struct TaskRow: View {
 
     private func creditText(_ st: (state: String, hit: LogHit?)) -> String {
         guard acc.isEnabled, st.state == "done" else { return "+0" }
+        // 今日已签到（本次跳过）没有新增积分，用破折号而不是 +0，避免看起来像"签了但没给"
+        if st.hit?.skipped == true { return "—" }
         return "+\(Int(st.hit?.credits ?? 0))"
+    }
+
+    private func creditColor(_ st: (state: String, hit: LogHit?)) -> Color {
+        guard acc.isEnabled, st.state == "done", st.hit?.skipped != true else { return Theme.textSub }
+        return Theme.success
     }
 
     private func recentText(_ st: (state: String, hit: LogHit?)) -> String {
@@ -759,13 +844,17 @@ struct TaskRow: View {
     }
 
     @ViewBuilder
-    private func statusPill(_ state: String) -> some View {
+    private func statusPill(_ st: (state: String, hit: LogHit?)) -> some View {
         if !acc.isEnabled {
             StatusPill(text: "已停用", color: Theme.neutral, bg: Theme.chipBG)
         } else {
-            switch state {
-            case "done": StatusPill(text: "已完成", color: Theme.success, bg: Theme.successSoft)
+            switch st.state {
+            case "done":
+                // 区分「本次真的签到了」和「今天早就签过、本次直接跳过」
+                StatusPill(text: st.hit?.skipped == true ? "已签到" : "已完成",
+                           color: Theme.success, bg: Theme.successSoft)
             case "fail": StatusPill(text: "签到失败", color: Theme.accent, bg: Theme.accentSoft)
+            case "restricted": StatusPill(text: "平台受限", color: Theme.warn, bg: Theme.warnSoft)
             default:     StatusPill(text: "待签到", color: Theme.neutral, bg: Theme.chipBG)
             }
         }
@@ -780,7 +869,7 @@ struct TaskRow: View {
             switch state {
             case "done":
                 Text("已签到").font(.system(size: 12.5)).foregroundColor(Theme.textFaint)
-            case "fail":
+            case "fail", "restricted":
                 Button { m.runSingleSign(acc.name) } label: {
                     Text(busy ? "重试中" : "重试")
                         .font(.system(size: 12.5, weight: .semibold))
@@ -882,7 +971,7 @@ struct ResultCard: View {
                 }
 
                 if reds.isEmpty && green.isEmpty {
-                    Text("暂无签到记录，点击右上角「手动签到」开始")
+                    Text("暂无签到记录：点顶部「手动签到」立即执行，或等待自动签到按计划执行。")
                         .font(.system(size: 12.5))
                         .foregroundColor(Theme.textSub)
                         .frame(maxWidth: .infinity)

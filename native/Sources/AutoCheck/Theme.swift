@@ -64,6 +64,14 @@ extension Color {
 /// 打包后位于 `Contents/Resources/<name>.png`，由 main bundle 命中；
 /// `swift run` 开发期回退到工程 assets 目录。取不到时调用方回退为首字方块。
 enum PlatformIcon {
+    /// 图标统一渲染尺寸上限（pt）。
+    ///
+    /// 为什么需要：SwiftUI 的 `Menu` 标签会**忽略内容里的 `.frame()`**，直接用
+    /// NSImage 的自然点尺寸绘制。而 `workbuddy.png` 是 512px@72dpi —— 自然尺寸
+    /// 就是 512pt，会把「新增账号」面板整个撑爆（同时把左侧账号列表挤窄到裁切）。
+    /// 这里统一把点尺寸压到 34pt 以内，任何漏加 `.frame()` 的用法最多只是偏大一点，
+    /// 不会再破坏布局；用 `.resizable()` 的地方本来按 frame 缩放，完全不受影响。
+    private static let maxPointSize: CGFloat = 34
     private static let cache = NSCache<NSString, NSImage>()
 
     static func image(_ name: String?) -> NSImage? {
@@ -75,8 +83,17 @@ enum PlatformIcon {
         }
         guard let image = img else { return nil }
         image.isTemplate = false
+        clampPointSize(image)
         cache.setObject(image, forKey: name as NSString)
         return image
+    }
+
+    /// 等比把 NSImage 的点尺寸压到上限内（只改「按多大画」，不动像素数据）
+    private static func clampPointSize(_ image: NSImage) {
+        let w = image.size.width, h = image.size.height
+        guard w > 0, h > 0, max(w, h) > maxPointSize else { return }
+        let k = maxPointSize / max(w, h)
+        image.size = NSSize(width: (w * k).rounded(), height: (h * k).rounded())
     }
 }
 
