@@ -31,6 +31,8 @@ import time
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
+import browser_deps  # noqa: E402  缺 playwright 时给出能照着做的提示
+
 ACCOUNTS_FILE = os.path.join(BASE_DIR, "accounts.json")
 STATE_DIR = os.path.join(BASE_DIR, ".browser_state")
 
@@ -240,6 +242,10 @@ def run_login(name: str, timeout_seconds: int, enabled: bool = True) -> int:
             ctx.close()
     except Exception as e:  # noqa: BLE001
         _log(f"内置浏览器异常：{e}")
+        # 缺 playwright 时原始信息只有 "No module named 'playwright'"，
+        # 用户看到的是"点了没反应、窗口不弹"，所以额外给一句照做就行的指引。
+        for line in browser_deps.explain(e):
+            _log(line)
         return 1
 
     # 若 localStorage 未捕获 Cloud-IDE-Token，用已捕获的长效会话 Cookie 主动换全新 JWT，

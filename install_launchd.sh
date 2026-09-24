@@ -15,8 +15,8 @@ cat > "$PLIST" <<EOF
   <string>com.marvis.autocheckin</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/python3</string>
-    <string>${TOOL_DIR}/checkin.py</string>
+    <string>/bin/bash</string>
+    <string>${TOOL_DIR}/run_checkin.sh</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict>

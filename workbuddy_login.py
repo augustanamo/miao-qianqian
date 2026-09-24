@@ -33,6 +33,7 @@ import urllib.request
 import webbrowser
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import browser_deps  # noqa: E402  缺 playwright 时给出能照着做的提示
 from workbuddy import _UA, _loads_body, _resp_msg  # noqa: E402
 from cookie_manager import load_config, save_config, find_account  # noqa: E402
 
@@ -318,6 +319,10 @@ def main() -> int:
                 return 1
             print(f"[LOG] 内置浏览器不可用（{type(e).__name__}: {e}），回退系统默认浏览器。",
                   flush=True)
+            # 回退能救急，但不能让它变成常态：缺 playwright 时给一句照做就行的修复指引，
+            # 否则用户会一直在系统浏览器里手动完成扫码，而不知道内置窗口为什么没了。
+            for line in browser_deps.explain(e):
+                print("[LOG] " + line, flush=True)
 
     if tokens is None:
         if mode == "manual":

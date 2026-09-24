@@ -22,8 +22,15 @@ final class AppModel: ObservableObject {
     /// 不得联动顶部"手动签到"批量按钮。
     @Published var singleSignName: String? = nil
     @Published var creditsRunning: Bool = false
-    @Published var selectedPage: Page = .checkin
+    /// 切走时清掉"从别处跳过来"的高亮：它只在刚跳过来的那一次有意义，
+    /// 留着会让下次自己进账号页时莫名有一行是亮着的。
+    @Published var selectedPage: Page = .checkin {
+        didSet { if selectedPage != .accounts { focusAccount = nil } }
+    }
     @Published var showingAddPanel: Bool = false
+    /// 从别处（签到页的异常弹窗）跳过来时要高亮的那一行账号名。
+    /// 账号列表按平台分组、一屏十几行，光把人丢到这一页他照样找不到是哪一行。
+    @Published var focusAccount: String? = nil
     @Published var toast: Toast?
     /// Toast 自动消失的定时任务（同一轮新 toast 会取消旧任务）
     private var toastDismissTask: DispatchWorkItem?
@@ -33,7 +40,17 @@ final class AppModel: ObservableObject {
     @Published var pythonHint: String = ""
 
     var parsed = ParsedLogs()
-    var pref = AppPrefs.load()
+    /// 今天各账号的子任务（读自签到台账），任务表「今日任务」列用。
+    /// 与 parsed 一样是普通 var：刷新后由 parseLogs() 统一发 objectWillChange。
+    var subTasks = SubTaskStore()
+    /// 偏好设置。设置页是"即时生效"的：任何字段改动都会立刻 save() 到
+    /// native_prefs.json，所以它必须是 @Published —— 否则改了设置、界面靠
+    /// 每秒 ticker 硬刷才更新，读数会慢半拍。
+    @Published var pref = AppPrefs.load()
+    /// 上次拉取积分/余额的时刻（设置页「积分刷新频率」用）
+    private var lastCreditsAt: Date?
+    /// launchd 任务重装的防抖任务（连点星期圆点不该触发多次 launchctl load）
+    private var launchdSyncWork: DispatchWorkItem?
     private var ticker: Timer?
     private var runningProcess: Process?
     private var retryCount = 0
@@ -52,14 +69,14 @@ final class AppModel: ObservableObject {
 
     /// 单个账号的积分/余额快照。
     /// 来源：checkin.py --credits --json 输出里 items 的每一条。
-    /// 各平台口径不同（Trae 积分 / B站硬币 / 联想乐豆 / 京豆），unit 标明实际单位。
+    /// 各平台口径不同（Trae 积分 / B站硬币 / 联想乐豆 / 移动云盘云朵），unit 标明实际单位。
     struct CreditInfo: Hashable {
-        /// 账号当前可用余额；nil 表示该平台没有给出余额（如京东无公开接口）
+        /// 账号当前可用余额；nil 表示该平台没有给出余额（如京东已停用、无公开接口）
         var balance: Double? = nil
         var used: Double? = nil
         var limit: Double? = nil
         var streak: Int? = nil
-        /// 平台侧单位：积分 / 硬币 / 乐豆 / 京豆
+        /// 平台侧单位：积分 / 硬币 / 乐豆 / 云朵
         var unit: String = "积分"
         /// 平台展示名（Trae / WorkBuddy / Bilibili …）
         var label: String = ""
@@ -70,6 +87,47 @@ final class AppModel: ObservableObject {
         var summary: String = ""
         /// 失败原因或"该平台未提供余额"的说明
         var message: String = ""
+        /// 逐包额度明细（WorkBuddy 额度包 / Trae 资格包），无该能力的平台为空。
+        /// 有了它"总额"才可核对，也才看得到消费明细。
+        var packages: [CreditPackage] = []
+        /// **非积分型资源**：目前只有阿里云盘的存储容量（字节）。
+        /// 与 balance 分开是刻意的 —— 容量不是点数，一旦混进 balance 就会被
+        /// 「账号积分总额」当成积分相加（GB 加进积分里，数字直接失去意义）。
+        var capacity: CreditCapacity? = nil
+        /// 与上一次**跨日**快照的差值。本地推算，不是平台接口给的数。
+        var prevBalance: Double? = nil
+        var prevDate: String = ""
+        var delta: Double? = nil
+
+        /// 明细里所有包的「已用」合计；无明细时回落到 used
+        var packageUsedTotal: Double {
+            packages.isEmpty ? (used ?? 0) : packages.reduce(0) { $0 + ($1.used ?? 0) }
+        }
+
+        /// "较上次"是否值得展示：没有对照、或恰好没变，就不占版面
+        var hasDelta: Bool { delta != nil && (delta ?? 0) != 0 }
+    }
+
+    /// 非积分型资源：阿里云盘的存储容量。单位一律字节，展示时再换算。
+    /// 与 CreditInfo.balance 分开，保证容量永远不会被当成积分参与求和。
+    struct CreditCapacity: Hashable {
+        var total: Double? = nil
+        var used: Double? = nil
+        var remain: Double? = nil
+    }
+
+    /// 一个额度包（平台侧的一条资源）。
+    struct CreditPackage: Hashable {
+        var name: String = ""
+        /// free / paid（WorkBuddy 的免费赠送包 / 付费包；Trae 统一算 paid）
+        var group: String = ""
+        var total: Double? = nil
+        var remain: Double? = nil
+        var used: Double? = nil
+        var unit: String = ""
+        /// 数字是「当日」口径（切片包确实读到了当日切片），否则为周期口径
+        var slice: Bool = false
+        var cycleEnd: String = ""
     }
 
     // MARK: 启动 / 刷新
@@ -79,6 +137,7 @@ final class AppModel: ObservableObject {
             pythonHint = "未找到可用的 Python 运行时，请安装 Python 3 后重试。\n可用环境变量 CHECKIN_PYTHON 指定。"
         }
         refreshAll(loadCredits: true)
+        healLaunchdIfNeeded()   // 服务掉线时自愈，否则"已开启"的定时会静默不触发
         probeWorkBuddy()   // 启动即探测本机 WorkBuddy 登录态健康（只读，不含 token）
         var logTicks = 0
         ticker = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -88,6 +147,24 @@ final class AppModel: ObservableObject {
             // 写入的 [OK]/[FAIL] 台账也能在界面刷新，避免"已签到但统计仍为 0"
             logTicks += 1
             if logTicks % 15 == 0 { self.parseLogs() }
+
+            // 每 15 分钟给定时任务做一次体检。
+            // 上面那个启动自愈只覆盖"重启 App"，而这个 App 常常一开好几天
+            // （本次事故就是连开三天，服务掉线后一路静默到用户自己发现）。
+            // 体检到"plist 在、服务没加载"时会重装，并顺手刷新界面上的定时状态。
+            if logTicks % 900 == 0 {
+                self.launchd = LaunchdManager.currentState()
+                self.healLaunchdIfNeeded()
+            }
+
+            // 设置页「积分刷新频率」：按该频率自动同步一次余额。
+            // 只在应用处于前台时跑 —— 关闭窗口后进程常驻后台，每 N 分钟拉起
+            // python 去打各平台接口没有意义，还容易触发平台限流。
+            let period = TimeInterval(max(5, self.pref.creditsRefreshMinutes) * 60)
+            if NSApp.isActive, !self.creditsRunning,
+               Date().timeIntervalSince(self.lastCreditsAt ?? .distantPast) >= period {
+                self.refreshCredits()
+            }
         }
         if pref.autoSignOnLaunch {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
@@ -115,18 +192,27 @@ final class AppModel: ObservableObject {
 
     func parseLogs() {
         parsed.load(path: AppPaths.logFile)
+        // 子任务读的是**签到台账**而不是日志：日志/台账里的 message 被截断到 160 字，
+        // "哪一步失败"恰恰最先被切掉，所以 Python 侧另存了结构化的 tasks 字段。
+        subTasks.load(path: AppPaths.stateFile, date: DayTool.today())
         objectWillChange.send()
     }
 
     // MARK: 派生数据
     func enabledAccounts() -> [Account] { accounts.filter { $0.isEnabled } }
 
+    /// 真正参与自动签到的账号：已启用 **且** 平台未在平台侧停用。
+    /// 京东这类平台整条链路已下线，Python 侧根本不会为它产生任何记录；
+    /// 若统计口径仍用「已启用」，它会永远显示"待签到"、永远挂在进度分母里
+    /// —— 正是用户要求消掉的那种噪音。列表里照旧可见（账号管理页），只是不计数。
+    func activeAccounts() -> [Account] { accounts.filter { $0.isEnabled && !$0.isRetired } }
+
     func todaySummary() -> (done: Int, fail: Int, pending: Int, credit: Double, total: Int, restricted: Int) {
         let today = DayTool.today()
-        // 以「启用账号」为口径汇总，避免把已删除/未启用账号的日志计入；
+        // 以「参与签到的账号」为口径汇总，避免把已删除/未启用/平台已停用的账号计入；
         // 通过 parsed.status 的前缀兼容匹配，确保日志名与账号名存在差异时也能正确归类（如"132" vs "132trae"）。
         // restricted 单列：平台受限不代表失败，不该计进 fail，也不该触发失败重试。
-        let en = enabledAccounts()
+        let en = activeAccounts()
         var doneCount = 0
         var failCount = 0
         var restrictedCount = 0
@@ -153,19 +239,107 @@ final class AppModel: ObservableObject {
         parsed.status(name: name, on: DayTool.today())
     }
 
-    /// 所有**启用**账号的积分/余额合计。
+    /// 任务表「今日任务」列要画的小图标。
+    /// 两条规则收在这**一处**，而不是散在视图里（以后多一个渲染点就得多抄一遍）：
+    ///   · `na`（不适用：如非年度会员没有 B币券）不画——长年灰着一个图标就是噪音；
+    ///   · 不足 2 项也不画——单动作平台的图标与「状态」列的胶囊完全重复。
+    func taskIcons(_ name: String) -> [SubTask] {
+        let items = subTasks.all(name).filter { $0.state != .na }
+        return items.count >= 2 ? items : []
+    }
+
+    // MARK: - 重新登录（凭证失效时的入口，账号页与异常弹窗共用）
+
+    /// 该账号的登录凭据是不是"需要重新登录"才能修好。两个来源，任一成立即可：
+    ///
+    /// ① 今天的签到失败，且失败文案指向凭据失效 —— **平台自己说的，最硬的证据**。
+    ///    判据复用 `CheckinIssue.diagnose()`，不在这里另写一套关键词表；
+    ///    之前"异常弹窗让人去重新登录、账号页却没有任何入口"就是因为两侧各判各的
+    ///    （弹窗按文案分类，账号页只看"Cookie 字段非空"）。
+    /// ② 凭据压根没用上（字段没填 / Trae 的 token 过期）—— 不必等签到失败就该给入口。
+    ///
+    /// 平台已停用的（京东）恒为 false：整条链路都下线了，重新登录也不会让签到恢复。
+    func needsRelogin(_ name: String) -> Bool {
+        guard let acc = accounts.first(where: { $0.name == name }), !acc.isRetired else { return false }
+        // WorkBuddy「本机登录态」来源（source != oauth）的账号，凭据真源在**桌面端**：
+        // 桌面端没登录、或桌面端把凭据加密了，这个账号**现在**就签不了。这属于静态事实，
+        // 不该等"今天签到失败"才给入口 —— 否则「凭证健康检查」卡会说"点下方重新登录"，
+        // 而账号行一个按钮都没有（smzdm 那个逻辑漏洞的同一形状）。
+        // 扫码登录的账号凭据自带在 accounts.json，与桌面端无关，走下面的通用判断。
+        if acc.isWorkBuddy, acc.workbuddy_auth?.source != "oauth" {
+            return wbHealthy == false
+        }
+        let st = accStatus(name)
+        if st.state == "fail", let hit = st.hit,
+           CheckinIssue(state: st.state, name: name, hit: hit).diagnose().fix == .relogin {
+            return true
+        }
+        if let hint = acc.credentialHint() { return hint.color != .green }
+        return false
+    }
+
+    /// 这个平台能不能在**本机**重新登录（内置浏览器 / 读本机登录态这两条路之一）。
+    /// 平台已停用的（京东）不算：整条链路都下线了，重新登录也不会让签到恢复，
+    /// 给了按钮反而是骗人去点。
+    func canRelogin(_ acc: Account) -> Bool {
+        if acc.isRetired { return false }
+        return acc.isWorkBuddy || acc.isTrae || acc.isCredentialPlatform
+    }
+
+    /// WorkBuddy 的「重新登录」到底该走**扫码**，还是重读本机桌面端登录态。
+    ///
+    /// 判断只留这一处：`relogin()` 的实际动作和视图上的按钮文案都调它 ——
+    /// 两处各判一遍的话，会出现"按钮写着『读取本机登录态』，点下去却弹出扫码页"。
+    ///   · 扫码登录（source == "oauth"）的账号，凭据自带，只能再扫一次；
+    ///   · 「本机登录态」来源的账号平时重读桌面端最省事，但桌面端把凭据**加密**之后
+    ///     那条路注定了只会吐一句"读不到明文 accessToken" → 直接改走扫码。
+    func workbuddyReloginUsesOAuth(_ acc: Account) -> Bool {
+        let fromDesktop = (acc.workbuddy_auth?.source ?? "") != "oauth"
+        return !(fromDesktop && !wbEncrypted)
+    }
+
+    /// 按平台路由到对应的重新登录动作，**沿用账号名**。
+    ///
+    /// 各登录脚本同名即更新凭据（`browser_login.save_cookie_account` → `set_cookie`，
+    /// 账号已存在时只改 auth 字段），所以这里不会新增重复账号，也不会动启用状态。
+    /// 各条路在成功后都会走 `verifyAfterRelogin` 真签一次，把界面状态同步到"已修好"。
+    func relogin(_ acc: Account) {
+        guard !acc.isRetired else {
+            showToast("「\(acc.app)」平台已停用，无需重新登录", .info)
+            return
+        }
+        if acc.isWorkBuddy {
+            if workbuddyReloginUsesOAuth(acc) {
+                runWorkBuddyOAuth(name: acc.name, relogin: true)
+            } else {
+                runWorkBuddyRefresh(name: acc.name)
+            }
+        } else if acc.isTrae {
+            runTraeLogin(name: acc.name, relogin: true)
+        } else if acc.isCredentialPlatform, let type = acc.type {
+            // relogin：沿用该账号自己的持久登录环境，不是新增
+            runCookieBrowserLogin(type: type, name: acc.name, mode: "relogin")
+        } else {
+            showToast("「\(acc.app)」暂不支持在本机重新登录", .info)
+        }
+    }
+
+    /// 所有**参与签到**账号的积分/余额合计。
     /// 注意各平台单位不同（积分/硬币/乐豆），这里是"点数总和"，
     /// 界面上会给出逐账号明细标明单位，便于核对。
     func totalCredits() -> Double {
-        enabledAccounts().reduce(0) { sum, acc in
+        activeAccounts().reduce(0) { sum, acc in
             sum + (creditsByAccount[acc.name]?.balance ?? 0)
         }
     }
 
-    /// 已查询到的账号数（余额非空），用于说明合计覆盖了几个账号
+    /// 已查询到资源的账号数（有余额或有容量），用于说明合计覆盖了几个账号
     func creditsCoverage() -> (counted: Int, total: Int) {
-        let en = enabledAccounts()
-        let counted = en.filter { creditsByAccount[$0.name]?.balance != nil }.count
+        let en = activeAccounts()
+        let counted = en.filter {
+            let c = creditsByAccount[$0.name]
+            return c?.balance != nil || c?.capacity != nil
+        }.count
         return (counted, en.count)
     }
 
@@ -177,20 +351,18 @@ final class AppModel: ObservableObject {
         ParsedLogs.streak(for: nil, logs: parsed, startDate: DayTool.today())
     }
 
-    func redBanners() -> [String] {
+    /// 今日的异常条目（签到失败 + 平台受限），按账号名排序。
+    /// 「签到结果与异常」卡的数据源：每条都能点开详情，并只针对该账号重试。
+    /// 平台受限一并列出——它看着像失败，但账号没问题，必须给出与失败不同的处理建议。
+    func issueItems() -> [CheckinIssue] {
         let today = DayTool.today()
-        let fails = parsed.todayFail(today)
-        return fails.keys.sorted().map { name in
-            let hit = fails[name]!
-            return "\(name) 签到失败；\(hit.msg)"
+        var items: [CheckinIssue] = parsed.todayFail(today).map {
+            CheckinIssue(state: "fail", name: $0.key, hit: $0.value)
         }
-    }
-
-    func greenText() -> String {
-        let oks = parsed.todayOK(DayTool.today())
-        let names = oks.keys.sorted()
-        guard !names.isEmpty else { return "" }
-        return "\(names.joined(separator: "、"))签到成功"
+        items += parsed.todayRestricted(today).map {
+            CheckinIssue(state: "restricted", name: $0.key, hit: $0.value)
+        }
+        return items.sorted { $0.name < $1.name }
     }
 
     func countdown() -> String {
@@ -215,7 +387,7 @@ final class AppModel: ObservableObject {
         return times.sorted().last
     }
 
-    // MARK: 签到（按启用的账号 --only，尊重 enabled，不依赖后端改动）
+    // MARK: 签到（按**参与签到**的账号 --only，尊重 enabled 与平台停用，不依赖后端改动）
     func runSign(only: String? = nil) {
         guard !signRunning, singleSignName == nil else { return }
         let names: [String]
@@ -224,7 +396,9 @@ final class AppModel: ObservableObject {
             runSingleSign(only)
             return
         }
-        let en = enabledAccounts()
+        // 平台侧已停用的账号（京东）不进批量：Python 侧本就会跳过，
+        // 放进来只会为它白起一个进程，还多一条 [停用] 日志。
+        let en = activeAccounts()
         if en.isEmpty {
             showToast("没有启用的账号，请先在账号管理添加/启用账号", .error)
             return
@@ -236,11 +410,25 @@ final class AppModel: ObservableObject {
         runSignSequence(names, index: 0)
     }
 
+    /// 行内单个账号签到的**来由**。动作完全相同，只影响提示文案 ——
+    /// 换完凭据后自动验证签到，如果照抄"正在重试…"，用户会以为自己点错了什么。
+    enum SingleSignPurpose {
+        case retry            // 用户点了行内「重试 / 签到」
+        case verifyAfterLogin // 刚更新完登录凭据，自动验证新凭据能不能签上
+    }
+
     /// 行内单个账号签到/重试：与批量手动签到( signRunning)完全独立，
     /// 不驱动顶部"手动签到"批量按钮的 loading，加载态显示在行内。
-    func runSingleSign(_ name: String) {
+    func runSingleSign(_ name: String, purpose: SingleSignPurpose = .retry) {
         guard singleSignName == nil, !signRunning else { return }
         singleSignName = name
+        // 明确报出"正在重试哪一个"：行内按钮很多，不给反馈就分不清点中的是哪一行
+        switch purpose {
+        case .retry:
+            showToast("正在重试「\(name)」…", .info)
+        case .verifyAfterLogin:
+            showToast("「\(name)」登录态已更新，正在验证签到…", .info)
+        }
         let proc = runPythonStream([AppPaths.projectDir + "/checkin.py", "--only", name]) { [weak self] line in
             guard let self = self else { return }
             self.runLines.append(line)
@@ -252,12 +440,67 @@ final class AppModel: ObservableObject {
             guard let self = self else { return }
             self.parseLogs()
             self.singleSignName = nil
-            let summary = self.todaySummary()
+            // 只报**这一个账号**的结果。旧实现报的是全局汇总（"成功 8 / 失败 1"），
+            // 点「重试」之后根本判断不出这个账号到底修好了没有。
+            let st = self.accStatus(name)
             self.refreshCredits()
-            self.showToast("\(name) 签到完成：\(self.summaryText(summary))",
-                           summary.fail == 0 ? .success : .error)
+            let ok = st.state == "done"
+            switch purpose {
+            case .retry:
+                if ok {
+                    self.showToast("「\(name)」重试成功", .success)
+                } else {
+                    self.showToast("「\(name)」仍然失败：\(st.hit?.msg ?? "未知原因")", .error)
+                }
+            case .verifyAfterLogin:
+                if ok {
+                    self.showToast("「\(name)」重新登录成功，签到已恢复", .success)
+                } else {
+                    // 凭据换了却仍然签不上 —— 必须说清楚"换的这一步成了、签的那一步还没成"，
+                    // 否则用户会以为是重新登录失败了，又去重扫一遍。
+                    self.showToast("「\(name)」登录态已更新，但签到仍失败：\(st.hit?.msg ?? "未知原因")", .error)
+                }
+            }
         }
         runningProcess = proc
+    }
+
+    /// 重新登录**成功之后**的关键一步：用真实签到自证凭据可用，并让界面立刻反映结果。
+    ///
+    /// 为什么非有这一步不可：账号行的状态胶囊、凭证健康检查卡、「重新登录」入口，
+    /// 全都从**今天的签到日志**推出来（`ParsedLogs.status`）。换凭据这件事本身
+    /// 不会改写今天那条失败记录 —— 于是用户刚扫码成功，那一行依然红着"签到失败"、
+    /// 依然挂着「重新登录」，看起来就像"重新登录根本没生效"（其实签到早就能用了，
+    /// 只是界面还在复述上午的旧结论）。只调 `loadAccounts()` 修不掉这个错觉：
+    /// 它刷新的只是凭据快照，不是状态。
+    ///
+    /// 所以这里补两件事：
+    ///   ① `parseLogs()`：磁盘上的日志/台账可能已被别处（定时任务、另一个窗口）写过；
+    ///   ② 真签一次：成功会在今天留下新记录，`status()` 的"成功 > 受限 > 失败"优先级
+    ///      自然把这一行翻成"已签到"，异常卡与健康卡同口径跟着落回正常。
+    /// 今天已经签过的、账号停用的、正忙的直接跳过 —— 不给对方接口发无谓的请求。
+    /// **每条分支都会给出反馈**：扫码成功后一声不吭，用户照样会以为没成功。
+    private func verifyAfterRelogin(_ name: String) {
+        loadAccounts()
+        parseLogs()
+        guard !name.isEmpty,
+              let acc = accounts.first(where: { $0.name == name }),
+              acc.isEnabled, !acc.isRetired else {
+            // 账号查不到 / 未启用 / 平台停用：登录这一步本身成功了，如实说一句就收工。
+            if !name.isEmpty { showToast("「\(name)」登录态已更新", .success) }
+            return
+        }
+        // 今天已经签过：状态本来就是对的，别为了"刷新一下"去多打一次对方接口。
+        if accStatus(name).state == "done" {
+            showToast("「\(name)」登录态已更新（今天已签到）", .success)
+            return
+        }
+        guard singleSignName == nil, !signRunning else {
+            // 有签到正在进行：它结束后自己会 parseLogs，状态不会漏。
+            showToast("「\(name)」登录态已更新（签到进行中，完成后自动刷新）", .info)
+            return
+        }
+        runSingleSign(name, purpose: .verifyAfterLogin)
     }
 
     private func runSignSequence(_ names: [String], index: Int) {
@@ -327,6 +570,7 @@ final class AppModel: ObservableObject {
     func refreshCredits(only: String? = nil) {
         guard !creditsRunning else { return }
         creditsRunning = true
+        lastCreditsAt = Date()   // 计时起点：手动点刷新也算一次，避免刚刷完又被定时器追着刷
         var args = [AppPaths.projectDir + "/checkin.py", "--credits", "--json"]
         if let only = only { args += ["--only", only] }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -360,6 +604,31 @@ final class AppModel: ObservableObject {
             c.state = it["state"] as? String ?? ""
             c.summary = it["summary"] as? String ?? ""
             c.message = it["message"] as? String ?? ""
+            c.packages = (it["packages"] as? [[String: Any]] ?? []).compactMap { p in
+                let name = p["name"] as? String ?? ""
+                guard !name.isEmpty else { return nil }
+                var k = CreditPackage()
+                k.name = name
+                k.group = p["group"] as? String ?? ""
+                k.total = num(p["total"])
+                k.remain = num(p["remain"])
+                k.used = num(p["used"])
+                k.unit = p["unit"] as? String ?? ""
+                k.slice = p["slice"] as? Bool ?? false
+                k.cycleEnd = p["cycle_end"] as? String ?? ""
+                return k
+            }
+            c.prevBalance = num(it["prev_balance"])
+            c.prevDate = it["prev_date"] as? String ?? ""
+            c.delta = num(it["delta"])
+            // 非积分型资源（阿里云盘容量）：字段名与 balance 明确分开
+            if let cap = it["capacity"] as? [String: Any] {
+                var g = CreditCapacity()
+                g.total = num(cap["total"])
+                g.used = num(cap["used"])
+                g.remain = num(cap["remain"])
+                c.capacity = (g.total != nil || g.remain != nil) ? g : nil
+            }
             newCredits[name] = c
         }
         creditsByAccount = newCredits
@@ -381,7 +650,7 @@ final class AppModel: ObservableObject {
             arr[i]["enabled"] = on
         }
         root["accounts"] = arr
-        writeJSONRoot(root)
+        _ = writeJSONRoot(root)
         loadAccounts()
     }
 
@@ -390,7 +659,7 @@ final class AppModel: ObservableObject {
         guard var arr = root["accounts"] as? [[String: Any]] else { return }
         arr.removeAll { ($0["name"] as? String) == account.name }
         root["accounts"] = arr
-        writeJSONRoot(root)
+        _ = writeJSONRoot(root)
         loadAccounts()
         showToast("已删除账号 \(account.name)", .info)
     }
@@ -408,14 +677,20 @@ final class AppModel: ObservableObject {
             arr[i]["name"] = trimmed
         }
         root["accounts"] = arr
-        writeJSONRoot(root)
+        _ = writeJSONRoot(root)
         loadAccounts()
     }
 
     /// Trae 浏览器登录。name 可留空：脚本按账号 ID 自动命名
     /// （Trae 登录态只有账号 ID，不含昵称）。
-    func runTraeLogin(name: String, enabled: Bool = true) {
+    /// relogin=true 表示这是"更新已有账号的凭据"，成功后会自动验证签到（见 verifyAfterRelogin）。
+    func runTraeLogin(name: String, enabled: Bool = true, relogin: Bool = false) {
         let nameT = name.trimmingCharacters(in: .whitespaces)
+        // 同 runCookieBrowserLogin：Trae 登录也没有回退路径，缺组件就别开进程
+        guard Py.browserReady else {
+            showToast("内置浏览器组件缺失，先在终端执行 bash setup_browser.sh", .error)
+            return
+        }
         if let cur = loginAccount, cur != nameT {
             showToast("请先等待账号「\(cur)」登录完成", .error)
             return
@@ -425,14 +700,21 @@ final class AppModel: ObservableObject {
         loginLines = ["正在打开内置浏览器（\(nameT.isEmpty ? "账号名称将自动读取" : "账号 " + nameT)）…",
                       "请在浏览器窗口中完成 Trae 登录，程序会自动识别并保存。"]
         runningProcess = runPythonStream([AppPaths.projectDir + "/trae_login.py", "--name", nameT,
-                                          "--enabled", enabled ? "1" : "0"]) { [weak self] line in
+                                          "--enabled", enabled ? "1" : "0"],
+                                         python: Py.detectBrowser()) { [weak self] line in
             self?.loginLines.append(line)
         } completion: { [weak self] code in
             self?.loginRunning = false
             self?.loginAccount = nil
             if code == 0 {
-                self?.loadAccounts()
-                self?.showToast("登录完成，账号已保存", .success)
+                if relogin {
+                    // 换完凭据立刻自证：否则今天那条失败记录会继续挂着，
+                    // 界面看起来和"重新登录没生效"一模一样。
+                    self?.verifyAfterRelogin(nameT)
+                } else {
+                    self?.loadAccounts()
+                    self?.showToast("登录完成，账号已保存", .success)
+                }
                 // 设置页「登录时同步历史积分」：登录成功后顺带拉一次积分
                 if self?.pref.syncHistoryCreditsOnLogin == true { self?.refreshCredits() }
             } else {
@@ -446,10 +728,24 @@ final class AppModel: ObservableObject {
     /// 弹出内置浏览器，用户扫码/账密登录后自动抓取 Cookie 写回 accounts.json，
     /// 完成后后台校验并回填昵称。Cookie 等同密码，仅本机存储，UI/日志不回显明文。
     /// name 可留空：脚本会在验证通过后读取该账号真实昵称自动命名。
-    func runCookieBrowserLogin(type: String, name: String, enabled: Bool = true) {
+    ///
+    /// mode：`add`=新增账号 / `relogin`=更新已有账号的凭据。
+    /// **必须由调用方明确指定**：脚本无法只凭 name 分辨"新增一个叫 X 的账号"和
+    /// "更新账号 X"，而这两种动作用的浏览器会话完全不同 —— 新增必须是无痕的
+    /// 全新会话（否则会读到上次那个账号的登录态并把它当成新账号保存），
+    /// 详见 browser_login._profile_dir。
+    func runCookieBrowserLogin(type: String, name: String, enabled: Bool = true,
+                               mode: String = "add") {
         let nameT = name.trimmingCharacters(in: .whitespaces)
+        let isAdd = mode != "relogin"
         guard let meta = Self.cookiePlatforms.first(where: { $0.type == type }) else {
             showToast("未知平台类型", .error); return
+        }
+        // 这个动作**没有回退路径**（不像 WorkBuddy OAuth 能退到系统浏览器），
+        // 缺了内置浏览器就必然失败 —— 就地拦下，别让用户干等一个注定失败的进程。
+        guard Py.browserReady else {
+            showToast("内置浏览器组件缺失，先在终端执行 bash setup_browser.sh", .error)
+            return
         }
         if let cur = loginAccount, cur != nameT {
             showToast("请先等待账号「\(cur)」登录完成", .error)
@@ -458,21 +754,36 @@ final class AppModel: ObservableObject {
         loginRunning = true
         loginAccount = nameT.isEmpty ? "(自动命名)" : nameT
         loginLines = ["正在打开内置浏览器（\(meta.label)\(nameT.isEmpty ? "／账号名称将自动读取" : " / " + nameT)）…",
-                      "请在浏览器窗口中扫码或账密登录，程序会自动抓取 Cookie 并保存（等同密码，仅本机存储）。"]
+                      isAdd ? "新增账号：这是全新的浏览器会话，不读取任何历史登录态，"
+                            + "可放心登录要新增的那个账号。"
+                            : "重新登录：沿用本账号自己的登录环境，登录后覆盖保存它的登录态。",
+                      "请在浏览器窗口中扫码或账密登录，程序会自动识别并保存登录态（等同密码，仅本机存储）。"]
         runningProcess = runPythonStream([AppPaths.projectDir + "/browser_login.py", "--platform", type,
-                                          "--name", nameT, "--enabled", enabled ? "1" : "0"]) { [weak self] line in
+                                          "--name", nameT, "--enabled", enabled ? "1" : "0",
+                                          "--mode", mode],
+                                         python: Py.detectBrowser()) { [weak self] line in
             self?.loginLines.append(line)
         } completion: { [weak self] code in
             self?.loginRunning = false
             self?.loginAccount = nil
             guard let self = self else { return }
             if code == 0 {
-                self.loadAccounts()
-                self.showToast("登录完成，账号已保存", .success)
-                // 名称留空时脚本已按昵称自动命名，无需（也无法）再按名回填昵称
-                if !nameT.isEmpty {
-                    self.probeCookieNickname(type: type, name: nameT)   // 后台校验并回填昵称
+                if isAdd {
+                    self.loadAccounts()
+                    self.showToast("登录完成，账号已保存", .success)
+                    // 名称留空时脚本已按昵称自动命名，无需（也无法）再按名回填昵称
+                    if !nameT.isEmpty {
+                        self.probeCookieNickname(type: type, name: nameT)   // 后台校验并回填昵称
+                    }
+                } else {
+                    // 更新已有账号：换完凭据立刻真签一次，把这一行的状态从"签到失败"
+                    // 翻成真实结论（内部会 loadAccounts() 刷新凭据快照）。
+                    self.verifyAfterRelogin(nameT)
                 }
+            } else if code == 3 {
+                // 约定：这次登录的其实是本机**已有**账号，脚本按约定没有写盘。
+                // 不能提示"成功" —— 那会让用户带着"新账号已经加上了"的误解离开。
+                self.showToast("这次登录的还是已有账号，未新增；请换另一个账号再试", .error)
             } else {
                 self.showToast("登录未完成或已取消", .error)
             }
@@ -486,7 +797,9 @@ final class AppModel: ObservableObject {
     /// 回退系统浏览器。登录成功后 accessToken/refreshToken 由脚本写回
     /// accounts.json（.gitignore 排除），UI/日志只显示授权 URL 与脱敏结果，
     /// 绝不回显 token 明文。name 留空时脚本自动以昵称命名。
-    func runWorkBuddyOAuth(name: String, enabled: Bool = true) {
+    /// relogin=true 表示这是"更新已有账号的凭据"（同名只更新、不新增），
+    /// 成功后会自动验证签到（见 verifyAfterRelogin）。
+    func runWorkBuddyOAuth(name: String, enabled: Bool = true, relogin: Bool = false) {
         let nameT = name.trimmingCharacters(in: .whitespaces)
         if let cur = loginAccount, cur != nameT {
             showToast("请先等待账号「\(cur)」登录完成", .error)
@@ -497,15 +810,25 @@ final class AppModel: ObservableObject {
         loginLines = ["正在发起 WorkBuddy OAuth 扫码登录…",
                       "内置浏览器将打开授权页，请扫码并在页面中确认；登录成功会自动保存账号（token 等同密码，仅本机存储）。"]
         runningProcess = runPythonStream([AppPaths.projectDir + "/workbuddy_login.py",
-                                          "--name", nameT, "--enabled", enabled ? "1" : "0"]) { [weak self] line in
+                                          "--name", nameT, "--enabled", enabled ? "1" : "0"],
+                                         python: Py.detectBrowser()) { [weak self] line in
             self?.loginLines.append(line)
         } completion: { [weak self] code in
             self?.loginRunning = false
             self?.loginAccount = nil
             guard let self = self else { return }
             if code == 0 {
-                self.loadAccounts()
-                self.showToast("扫码登录完成，账号已保存", .success)
+                if relogin {
+                    // 脚本已把 source 改成 oauth、token 写回 accounts.json，但今天那条
+                    // 失败记录不会因此消失 —— 真签一次，让状态跟着凭据走。
+                    self.verifyAfterRelogin(nameT)
+                } else {
+                    self.loadAccounts()
+                    self.showToast("扫码登录完成，账号已保存", .success)
+                }
+                // 本机桌面端探针可能已过期：它的结果决定「本机登录态」来源的账号还给不给
+                // 「重新登录」入口，顺手刷一次，别让新增面板继续念旧结论。
+                self.probeWorkBuddy()
             } else if code == 2 {
                 self.showToast("已取消扫码登录", .error)
             } else {
@@ -514,10 +837,17 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// 本机 WorkBuddy 登录态健康探针。nil=未探测；true=文件存在且有 accessToken。
+    /// 本机 WorkBuddy 登录态健康探针。nil=未探测；true=文件存在且有**明文** accessToken。
     @Published var wbHealthy: Bool? = nil
     /// 本机 WorkBuddy 昵称（仅用于展示，脱敏无敏感信息）
     @Published var wbNickname: String = ""
+    /// 本机登录态是不是已被桌面端**加密**（新版把 accessToken 写成 `$wbEncrypted` 信封，
+    /// 密钥在不落盘的原生模块里）。必须和"压根没登录"分开说 —— 前者重登桌面端也没用，
+    /// 唯一出路是改走扫码登录；混在一起用户只会反复重登。
+    @Published var wbEncrypted: Bool = false
+    /// 探针给的原因原文。UI 直接展示，**不在这里另编一句** ——
+    /// 之前就是自己编了句"请先打开桌面端登录"，把"加密不可读"这个真实原因盖掉了。
+    @Published var wbReason: String = ""
 
     /// 异步探测本机 WorkBuddy 登录态（只读，不含 token）。
     func probeWorkBuddy() {
@@ -525,14 +855,20 @@ final class AppModel: ObservableObject {
             let r = runPythonCapture([AppPaths.projectDir + "/workbuddy.py", "--probe"], timeout: 20)
             var healthy: Bool? = nil
             var nickname = ""
+            var encrypted = false
+            var reason = ""
             if let data = r.out.data(using: .utf8),
                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 healthy = (obj["found"] as? Bool == true) && (obj["has_token"] as? Bool == true)
                 nickname = obj["nickname"] as? String ?? ""
+                encrypted = obj["encrypted"] as? Bool == true
+                reason = obj["reason"] as? String ?? ""
             }
             DispatchQueue.main.async {
                 self?.wbHealthy = healthy
                 self?.wbNickname = nickname
+                self?.wbEncrypted = encrypted
+                self?.wbReason = reason
             }
         }
     }
@@ -590,7 +926,7 @@ final class AppModel: ObservableObject {
                     "workbuddy_auth": snapshot,
                 ]
                 if let i = arr.firstIndex(where: { ($0["name"] as? String) == finalName }) {
-                    var old = arr[i]
+                    let old = arr[i]
                     entry["enabled"] = old["enabled"] ?? enabled
                     arr[i] = entry
                 } else {
@@ -655,9 +991,10 @@ final class AppModel: ObservableObject {
                 }
                 root["accounts"] = arr
                 if self.writeJSONRoot(root) {
-                    self.loadAccounts()
                     self.wbHealthy = true
-                    self.showToast("已刷新 WorkBuddy 登录态", .success)
+                    // 凭据快照刷新 ≠ 界面状态刷新：今天那条失败记录还挂着，
+                    // 真签一次才算把这一行修好（见 verifyAfterRelogin）。
+                    self.verifyAfterRelogin(nameT)
                 } else {
                     self.showToast("保存账号失败", .error)
                 }
@@ -671,21 +1008,65 @@ final class AppModel: ObservableObject {
         return f.string(from: Date())
     }
 
-    // MARK: Cookie 型平台（Bilibili / 联想智选 / 京东）
+    // MARK: Cookie 型平台（Bilibili / 联想智选 / 什么值得买 / 阿里云盘 / 中国移动云盘）
     /// 平台元数据：type -> (标签, accounts.json 的 auth 字段名)
+    ///
+    /// 京东（jd）仍在表里，但它**不会出现在「新增账号」的平台下拉里**（见
+    /// `addableCookiePlatforms`）：京豆签到整条链路已在平台侧下线，留着入口只会
+    /// 让用户白折腾一次，然后每天都看到一条无意义的橙色记录。已有账号仍保留，
+    /// 可查看、可更新凭据、可删除。
     static let cookiePlatforms: [(type: String, label: String, authKey: String)] = [
         ("bilibili", "Bilibili", "bilibili_auth"),
         ("lenovo", "联想智选", "lenovo_auth"),
+        ("smzdm", "什么值得买", "smzdm_auth"),
+        ("aliyunpan", "阿里云盘", "aliyunpan_auth"),
+        ("caimcloud", "中国移动云盘", "caimcloud_auth"),
         ("jd", "京东", "jd_auth"),
     ]
+
+    /// 可以在「新增账号」里选的平台 = 全部平台 − 平台侧已停用的。
+    /// 新平台加进 cookiePlatforms 即自动出现在下拉里，不用再改视图。
+    static var addableCookiePlatforms: [(type: String, label: String, authKey: String)] {
+        cookiePlatforms.filter { !Account.isRetiredType($0.type) }
+    }
+
+    /// 凭据在 <platform>_auth 里的字段名。**必须与真实存的东西一致**：
+    /// 阿里云盘是 refresh_token（在浏览器 localStorage 里，不是 Cookie）、
+    /// 中国移动云盘是 authorization 授权码（值是 `授权码#手机号`）——
+    /// 字段名跟着变，否则又会出现"标签写 Cookie、实际存的是令牌"那种查不出来的错配。
+    static func credentialField(for type: String) -> String {
+        if type == "aliyunpan" { return "refresh_token" }
+        if type == "caimcloud" { return "authorization" }
+        return "cookie"
+    }
+
+    /// 凭据的中文名（列表标签、提示文案、Toast 共用一处，别再各写一份）。
+    static func credentialNoun(for type: String) -> String {
+        if type == "aliyunpan" { return "刷新令牌" }
+        if type == "caimcloud" { return "授权码" }
+        return "Cookie"
+    }
 
     static func cookieScript(for type: String) -> String? {
         switch type {
         case "bilibili": return "bilibili.py"
         case "lenovo": return "lenovo.py"
         case "jd": return "jd.py"
+        case "smzdm": return "smzdm.py"
+        case "aliyunpan": return "aliyunpan.py"
+        case "caimcloud": return "caimcloud.py"
         default: return nil
         }
+    }
+
+    /// 名称留空时按凭据自动推导账号名；推不出来返回 nil（目前只有移动云盘有这个能力）。
+    /// 单独抽出来是为了让 UI 能提前判断"名称可以留空"（据此决定保存按钮是否可点），
+    /// 而不是等点下去才蹦一句"账号名不能为空"。
+    static func autoName(type: String, credential: String) -> String? {
+        guard type == "caimcloud" else { return nil }
+        let digits = credential.split(separator: "#").last.map { String($0) } ?? ""
+        let tail = String(digits.filter { $0.isNumber }.suffix(4))
+        return tail.count == 4 ? "移动云盘-\(tail)" : nil
     }
 
     /// 添加/更新 Cookie 型平台账号。cookie 等同密码：仅写入 accounts.json
@@ -695,10 +1076,14 @@ final class AppModel: ObservableObject {
         guard let meta = Self.cookiePlatforms.first(where: { $0.type == type }) else {
             showToast("未知平台类型", .error); onDone?(false); return
         }
-        let nameT = name.trimmingCharacters(in: .whitespaces)
         let cookieT = cookie.trimmingCharacters(in: .whitespaces)
+        let noun = Self.credentialNoun(for: type)
+        // 名称允许留空：能自动命名就用自动名（移动云盘的凭据自带手机号），
+        // 与其他平台的"不填就自动命名"保持一致。
+        var nameT = name.trimmingCharacters(in: .whitespaces)
+        if nameT.isEmpty, let auto = Self.autoName(type: type, credential: cookieT) { nameT = auto }
         guard !nameT.isEmpty, !cookieT.isEmpty else {
-            showToast("账号名与 Cookie 不能为空", .error); onDone?(false); return
+            showToast("账号名与\(noun)不能为空", .error); onDone?(false); return
         }
         guard var root = readJSONRoot() ?? (["accounts": [] as [[String: Any]]] as [String: Any]?),
               var arr = root["accounts"] as? [[String: Any]] else {
@@ -710,7 +1095,7 @@ final class AppModel: ObservableObject {
             "type": type,
             "enabled": enabled,
             meta.authKey: [
-                "cookie": cookieT,
+                Self.credentialField(for: type): cookieT,
                 "saved_at": nowString(),
                 "updated_at": nowString(),
             ],
@@ -742,21 +1127,28 @@ final class AppModel: ObservableObject {
               var root = readJSONRoot(),
               var arr = root["accounts"] as? [[String: Any]] else { return }
         let cookieT = cookie.trimmingCharacters(in: .whitespaces)
+        let noun = Self.credentialNoun(for: type)
         guard !cookieT.isEmpty else {
-            showToast("Cookie 不能为空", .error); return
+            showToast("\(noun)不能为空", .error); return
         }
         for i in arr.indices where arr[i]["name"] as? String == name {
             arr[i]["type"] = type
             arr[i]["app"] = meta.label
             var auth = (arr[i][meta.authKey] as? [String: Any]) ?? [:]
-            auth["cookie"] = cookieT
+            // 写入平台对应的字段名；同时清掉另外两种，避免新旧凭据并存导致读错
+            // （阿里云盘 refresh_token / 移动云盘 authorization / 其余 cookie）。
+            let field = Self.credentialField(for: type)
+            auth[field] = cookieT
+            for other in ["cookie", "refresh_token", "authorization"] where other != field {
+                auth[other] = nil
+            }
             auth["updated_at"] = nowString()
             arr[i][meta.authKey] = auth
         }
         root["accounts"] = arr
         if writeJSONRoot(root) {
             loadAccounts()
-            showToast("已更新「\(name)」的 Cookie", .success)
+            showToast("已更新「\(name)」的\(noun)", .success)
             probeCookieNickname(type: type, name: name)
         } else {
             showToast("保存失败", .error)
@@ -766,7 +1158,11 @@ final class AppModel: ObservableObject {
     /// 后台探测 Cookie 有效性并回填昵称（只读，不阻塞添加流程）。
     /// 校验失败仅提示，不删除已保存的账号。
     private func probeCookieNickname(type: String, name: String) {
+        // 平台侧已停用的（京东）：接口本身就是死的，探测只会换来一句
+        // "校验未通过"，属于噪音，直接跳过。
+        guard !Account.isRetiredType(type) else { return }
         guard let script = Self.cookieScript(for: type) else { return }
+        let noun = Self.credentialNoun(for: type)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let r = runPythonCapture([AppPaths.projectDir + "/" + script, "--probe", "--name", name], timeout: 25)
             let obj = (try? JSONSerialization.jsonObject(with: r.out.data(using: .utf8) ?? Data())) as? [String: Any]
@@ -779,7 +1175,7 @@ final class AppModel: ObservableObject {
                     self.updateCookieNickname(name: name, nickname: nickname)
                 }
                 if !healthy {
-                    self.showToast("Cookie 校验未通过：\(message.isEmpty ? "无法登录，请检查后重试" : message)", .error)
+                    self.showToast("\(noun)校验未通过：\(message.isEmpty ? "无法登录，请检查后重试" : message)", .error)
                 }
             }
         }
@@ -800,9 +1196,32 @@ final class AppModel: ObservableObject {
     }
 
     // MARK: launchd
+    /// 时间点为空时按默认 21:30 兜底。launchd 任务、汇总提醒、策略预览三处
+    /// 都读这一个口径，避免某处拿到空数组各自兜底出不同的时间。
+    var effectiveTimes: [[Int]] { pref.times.isEmpty ? [[21, 30]] : pref.times }
+
+    /// 下一个待执行的签到时间点（距零点分钟数）+ 是否落在今天。
+    /// 真源是 pref.times —— 不要读 plist 里的首个时间：多时间点或已经过点时它是错的。
+    private func nextFire() -> (minutes: Int, today: Bool)? {
+        let list = effectiveTimes.map { $0[0] * 60 + ($0.count > 1 ? $0[1] : 0) }.sorted()
+        guard !list.isEmpty else { return nil }
+        let now = Calendar.current.dateComponents([.hour, .minute], from: Date())
+        let nowMin = (now.hour ?? 0) * 60 + (now.minute ?? 0)
+        if let n = list.first(where: { $0 > nowMin }) { return (n, true) }
+        return (list[0], false)
+    }
+
+    func nextFireMinutes() -> Int? { nextFire()?.minutes }
+
+    /// 下一次定时签到的时刻文案："今天 21:30" / "明天 09:00"
+    func nextFireText() -> String {
+        guard let f = nextFire() else { return "—" }
+        return String(format: "%@ %02d:%02d", f.today ? "今天" : "明天", f.minutes / 60, f.minutes % 60)
+    }
+
     func autoToggle(_ on: Bool) {
         if on {
-            let r = LaunchdManager.install(times: pref.times.isEmpty ? [[21, 30]] : pref.times,
+            let r = LaunchdManager.install(times: effectiveTimes,
                                            weekdays: pref.weekdays, staggerMinutes: pref.staggerMinutes)
             showToast(r.msg, r.ok ? .success : .error)
         } else {
@@ -812,18 +1231,49 @@ final class AppModel: ObservableObject {
         refreshAll()
     }
 
-    func applyLaunchdSettings() {
-        // 仅在用户已开启自动签到（launchd 任务已安装）时更新定时任务；
-        // 自动签到未开启时，保存设置不应擅自安装任务（避免静默重开自动签到）
-        if launchd.installed {
-            let r = LaunchdManager.install(times: pref.times.isEmpty ? [[21, 30]] : pref.times,
-                                           weekdays: pref.weekdays, staggerMinutes: pref.staggerMinutes)
-            showToast(r.msg, r.ok ? .success : .error)
-        } else {
-            showToast("设置已保存", .info)
+    /// 设置页改动后的收尾：偏好已经由设置页写盘，这里只负责把 launchd 任务
+    /// 按新参数重装一次 —— 做 0.5s 防抖，连点星期圆点只会重装一次。
+    /// 未开启自动签到时不安装任务：避免用户在设置页随手改个时间就把定时签到
+    /// 静默打开（旧版 commit() 有这个隐患）。
+    func syncLaunchdIfNeeded() {
+        launchdSyncWork?.cancel()
+        guard launchd.installed else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            let r = LaunchdManager.install(times: self.effectiveTimes,
+                                           weekdays: self.pref.weekdays,
+                                           staggerMinutes: self.pref.staggerMinutes)
+            self.launchd = LaunchdManager.currentState()
+            if !r.ok { self.showToast(r.msg, .error) }
         }
-        pref.save()
-        refreshAll()
+        launchdSyncWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    /// 启动时的自愈：**plist 在、服务却掉线**是最坏的一种状态 ——
+    /// 界面上显示"已开启"（installed 为真），实际 launchd 里根本没有它，
+    /// 一次都不会触发；而且没有任何路径会去修，因为 syncLaunchdIfNeeded
+    /// 只在设置页改动时才调用（用户不改设置就永远救不回来）。
+    ///
+    /// 2026-09 的真实事故：服务掉线后连着几天 9:00 静默没跑，
+    /// 用户只能靠自己发现"到点没签到"。这里在启动后补装一次。
+    /// 只在「已安装但未加载」时动手，所以不会覆盖用户的开关状态：
+    /// 主动关闭自动签到会删掉 plist → installed 为假 → 这里不触发。
+    func healLaunchdIfNeeded() {
+        guard launchd.installed, !launchd.loaded else { return }
+        // 等启动那波磁盘/进程忙碌过去再动手，避免和 refreshAll 抢 launchctl
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self = self, self.launchd.installed, !self.launchd.loaded else { return }
+            let r = LaunchdManager.install(times: self.effectiveTimes,
+                                           weekdays: self.pref.weekdays,
+                                           staggerMinutes: self.pref.staggerMinutes)
+            self.launchd = LaunchdManager.currentState()
+            if r.ok {
+                self.showToast("定时任务此前未生效，已自动重新加载", .success)
+            } else {
+                self.showToast("定时任务未生效，自动加载失败：\(r.msg)", .error)
+            }
+        }
     }
 
     // MARK: 通知
@@ -843,10 +1293,11 @@ final class AppModel: ObservableObject {
     // MARK: 每日汇总提醒（设置页「每日汇总提醒」开关）
     private static let digestID = "com.marvis.autocheck.daily-digest"
 
-    /// 在当天最后一个签到时间点之后半小时提醒，内容为当前仍未签到的账号。
+    /// 在当天最后一个签到时间点之后**一小时**提醒，内容为当前仍未签到的账号。
+    /// （设置页的「每天 XX:XX 提醒」文案就是按 +1 小时算的，改动这里要同步改文案。）
     func scheduleDailyDigest() {
         let center = UNUserNotificationCenter.current()
-        let last = (pref.times.isEmpty ? [[21, 30]] : pref.times).max { ($0[0], $0[1]) < ($1[0], $1[1]) } ?? [21, 30]
+        let last = effectiveTimes.max { ($0[0], $0[1]) < ($1[0], $1[1]) } ?? [21, 30]
         var comp = DateComponents()
         comp.hour = (last[0] + 1) % 24
         comp.minute = last[1]
@@ -871,7 +1322,8 @@ final class AppModel: ObservableObject {
     private func dailyDigestBody() -> String {
         // 平台受限的账号不算"未签到"（对方活动下线/风控，用户没什么可做的），
         // 但要在摘要里点一句，免得用户看到"全部完成"又发现状态是橙的。
-        let enabled = accounts.filter { $0.isEnabled }
+        // 平台已停用的（京东）连提都不提：它不参与签到，报出来只是噪音。
+        let enabled = activeAccounts()
         let pending = enabled.filter {
             let s = accStatus($0.name).state
             return s != "done" && s != "restricted"
@@ -911,6 +1363,10 @@ final class AppModel: ObservableObject {
         var text = "喵签签 原生版诊断信息\n"
         text += "时间：\(Date())\n"
         text += "Python：\(Py.detect())\n"
+        // 内置浏览器是"重新登录 / 新增账号 / Trae 登录"的硬依赖，缺了就是一行
+        // "No module named 'playwright'" 埋在日志里，所以放进诊断信息随复制带走。
+        text += "内置浏览器：\(Py.browserReady ? "就绪" : "缺失（需要 bash setup_browser.sh）")"
+        text += "  解释器：\(Py.detectBrowser())\n"
         text += "项目目录：\(AppPaths.projectDir)\n"
         text += "账号数：\(accounts.count)（启用 \(enabledAccounts().count)）\n"
         text += "今日：成功 \(sum.done) / 失败 \(sum.fail) / 待签到 \(sum.pending)\n"

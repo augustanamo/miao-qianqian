@@ -86,26 +86,63 @@ def auth_field(platform: str) -> str:
     return f"{platform}_auth"
 
 
+# 少数平台的凭据不是 Cookie 而是另一种令牌，落盘字段名必须名副其实，
+# 否则又会出现「标签写 Cookie、实际存的是 refresh_token」那种静默错配。
+# aliyunpan：登录态是 refresh_token（存在浏览器 localStorage 里，不在 Cookie 中）。
+# caimcloud：登录态是 authorization 授权码（App 抓包或网页 cookie 里的 authorization），
+#            值是 `<authorization>#<手机号>` 两段——SSO 换 token 时两段都要用。
+CREDENTIAL_FIELD = {
+    "aliyunpan": "refresh_token",
+    "caimcloud": "authorization",
+}
+
+# 凭据的中文名。界面文案必须跟字段说实话——「标签写 A、实际只吃 B」是最坏的一类
+# 入口，用户会照着标签粘错东西，而且还不报错。
+CREDENTIAL_LABEL = {
+    "aliyunpan": "刷新令牌",
+    "caimcloud": "授权码",
+}
+
+
+def credential_field(platform: str) -> str:
+    """平台凭据在 <platform>_auth 里的字段名（默认 cookie）。"""
+    return CREDENTIAL_FIELD.get(platform, "cookie")
+
+
+def credential_label(platform: str) -> str:
+    """凭据的中文名，用于界面文案（避免把 refresh_token 叫成 Cookie）。"""
+    return CREDENTIAL_LABEL.get(platform, "Cookie")
+
+
 # ----------------------------------------------------------------------
-# Cookie 读取 / 写入
+# Cookie / 凭据 读取、写入
 # ----------------------------------------------------------------------
-def get_cookie(acc: dict | None, platform: str) -> str:
-    """从账号条目读取 cookie（仅内存返回，绝不落盘/打印）。"""
+def get_cookie(acc: dict | None, platform: str, field: str | None = None) -> str:
+    """从账号条目读取凭据（仅内存返回，绝不落盘/打印）。
+
+    field 默认按 credential_field(platform) 取；若该字段为空，再回退读 "cookie"，
+    这样历史上误存进 cookie 字段的账号不会突然读不到。
+    """
     if not isinstance(acc, dict):
         return ""
     auth = acc.get(auth_field(platform)) or {}
-    cookie = (auth.get("cookie") or "") if isinstance(auth, dict) else ""
-    return cookie.strip()
+    if not isinstance(auth, dict):
+        return ""
+    name = field or credential_field(platform)
+    value = (auth.get(name) or "").strip()
+    if not value and name != "cookie":
+        value = (auth.get("cookie") or "").strip()
+    return value
 
 
-def require_cookie(acc: dict | None, platform: str) -> str:
-    """读取 cookie；缺失时抛 CookieError（携带可读提示）。"""
-    cookie = get_cookie(acc, platform)
-    if not cookie:
+def require_cookie(acc: dict | None, platform: str, field: str | None = None) -> str:
+    """读取凭据；缺失时抛 CookieError（携带可读提示）。"""
+    value = get_cookie(acc, platform, field)
+    if not value:
         raise CookieError(
-            f"账号缺少 {platform} 的 cookie，请先在账号管理中更新 Cookie"
+            f"账号缺少 {platform} 的 {credential_label(platform)}，请先在账号管理中更新"
         )
-    return cookie
+    return value
 
 
 def set_cookie(config: dict, name: str, platform: str, cookie: str,
@@ -118,22 +155,52 @@ def set_cookie(config: dict, name: str, platform: str, cookie: str,
     """
     cookie = (cookie or "").strip()
     if not cookie:
-        raise CookieError("Cookie 为空，未保存")
+        raise CookieError("凭据为空，未保存")
     acc = find_account(config, name)
     if acc is None:
         return False
     auth = dict(acc.get(auth_field(platform)) or {})
-    auth["cookie"] = cookie
+    # 字段名跟着平台走：aliyunpan 存 refresh_token，其余平台存 cookie。
+    auth[credential_field(platform)] = cookie
     auth["updated_at"] = _now()
     if isinstance(extra, dict):
         for k, v in extra.items():
-            if k in ("cookie", "updated_at"):
+            if k in ("cookie", "refresh_token", "authorization", "updated_at"):
                 continue
             if v is not None and str(v).strip():
                 auth[k] = str(v).strip()
     acc["type"] = platform
     acc["app"] = platform
     acc[auth_field(platform)] = auth
+    return save_config(config, path)
+
+
+def update_credential(config: dict, name: str, platform: str, value: str,
+                      field: str | None = None, extra: dict | None = None,
+                      path: str | None = None) -> bool:
+    """只更新凭据字段，不动 type / app / nickname 等其它字段。
+
+    专门用于令牌轮换后的回写：阿里云盘每次刷新 access_token 都会同时下发
+    **新的** refresh_token，旧的会失效，所以必须存回去，否则账号只能用一次。
+    刻意不复用 set_cookie —— 后者会把 type/app 一并改写，回写过程不该动这些。
+    """
+    value = (value or "").strip()
+    if not value:
+        return False
+    acc = find_account(config, name)
+    if acc is None:
+        return False
+    key = auth_field(platform)
+    auth = dict(acc.get(key) or {})
+    auth[field or credential_field(platform)] = value
+    auth["updated_at"] = _now()
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            if k in ("cookie", "refresh_token", "authorization", "updated_at"):
+                continue
+            if v is not None and str(v).strip():
+                auth[k] = str(v).strip()
+    acc[key] = auth
     return save_config(config, path)
 
 

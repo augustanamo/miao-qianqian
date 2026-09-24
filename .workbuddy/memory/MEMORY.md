@@ -1,305 +1,148 @@
 # 项目约定（喵签签 / native 原生版）
 
-## UI 以设计稿为唯一真源
+> 各平台接口事实在 **`platforms.md`**；取证方法论在 skill `checkin-endpoint-forensics`。
+> 本文件只放**约定 + 落点**。
 
-- 设计稿位置：`~/Downloads/Design file/01 签到页.png` ~ `04 使用说明.png`，画布 **1440×900**。
-- **改 UI 前先量稿，不要凭肉眼印象调**。所有尺寸/配色都能用 PIL 量出来（系统 `python3` 没 PIL，
-  用 `/Users/augustanamo/.workbuddy/binaries/python/versions/3.13.12/bin/python3`）。
-- 量出来的值统一落在 `Theme.swift` 的令牌里，**视图层不许出现魔法数**。
-- 工作流细节见 skill `design-spec-to-swiftui`。
+## 验证与打包
+- **禁止自己 build/开 App**（用户手动测），静态检查可以。Swift 无构建校验命令见 skill
+  `swift-no-build-verification`——`-plugin-path` 必须是 **MacOSX**.platform，否则 @State 报千百条噪声。
+- `bash make_native_app.sh`：工具链→build→组装→图标→**重做 ad-hoc 签名**；`.app` 内增删文件必须在签名**之前**；
+  校验 `codesign --verify --strict`。
+- PIL 在托管 python3.13。
 
-## 已定的关键参数
+## 内置浏览器依赖（playwright + Chromium）
+- **唯一落点是项目自带的 `.venv`**（`bash setup_browser.sh` 建），**不许再装进 Marvis runtime**：
+  那个目录带版本号，宿主一升级就整目录删掉 —— 2026-09-17 `1.0.0.10316`→`10339` 就是这么把
+  playwright 弄丢的，全部凭据型平台的「重新登录 / 新增账号」一次性失效，而界面只说"登录未完成或已取消"。
+- base **必须 >= 3.10**（登录脚本签名用 `str | None`），优先 WorkBuddy 托管 python；
+  **base 变了必须 `venv --clear` 重建**，跨 base 复用会得到"playwright 在、却 import 就炸"的半坏态。
+- 浏览器本体在 `~/Library/Caches/ms-playwright/`（**在 venv 外面**，清 venv 不影响它）。
+- 调用方：`Bridge.detectBrowser()` 优先 `.venv/bin/python3`；`Bridge.browserReady` 认到
+  `site-packages/playwright/__init__.py` 才算就绪。**它是 `static let`，改完必须重启 App 才刷新**。
+- 报错统一走 `browser_deps.py`（把 ImportError 翻成"执行 bash setup_browser.sh"）。
 
-- 网格：顶栏 52 + 主体 816 + 底栏 32 = 900；侧栏 240 + 内容 1200 = 1440；页面左右 padding 38
-- 卡片：白底、1px `#E2E2E2` 描边、圆角 12；页面底色是**纯白**（不是浅灰）
-- 语义色：主红 `#FF3B30`、绿 `#22C55E`、软底 `#FFECEB` / `#E8F8EF`、灰胶囊 `#F5F5F5`
-- 深色面：侧栏 `#0A0A0A`、选中项与内嵌块 `#1A1A1A`、槽 `#2A2A2A`
-- 表格表头是**黑底通栏**（撑满卡片宽，不内缩）
-- 窗口：`.windowStyle(.hiddenTitleBar)` 自绘顶栏，**左侧预留 78pt** 给交通灯；
-  `.defaultSize(1440, 900)`，`minWidth 1280`
+## 定时任务（launchd）
+- `~/Library/LaunchAgents/com.marvis.autocheckin.plist` **只写时间**，执行交给项目根 `run_checkin.sh`
+  （`Bridge.swift::install()` 安装前会检查它存在）。**解释器路径绝不能进 plist**：Marvis runtime 是
+  带版本号的目录（升级即删旧版本 → launchd 退出码 127、签到静默不跑），且路径含空格
+  （拼进 shell 串漏引号会去执行 `/Users/xxx/Library/Application`）。启动器每次自己解析：
+  `CHECKIN_PYTHON` → `Versions/*`（按 mtime 倒序取第一个可执行的）→ homebrew → /usr/local → /usr/bin；
+  错峰走 `CHECKIN_STAGGER` 环境变量，不再拼命令行。
+- 排查入口：`launchctl print gui/501/com.marvis.autocheckin | grep -E "runs|last exit"`（127=命令没找到）；
+  `logs/launchd.log` 是脚本输出（改版前它是 bash 的报错，只有一行，极易忽略）。
+- **改完 plist 用 `launchctl load -w`**（legacy API，容忍度高）—— 2026-09-21 实测在本环境
+  **exit=0 成功**，别再信"自动化环境一律 EIO"（那次是 `bootout` 之后紧接着 bootstrap 命中 EIO，
+  连最小-plist 对照实验也一起失败，结论下早了）。遇到 EIO 先换 `load -w` 或隔一会儿重试，
+  别急着推给用户终端；`launchctl print gui/501/<label>` 有输出 = 已加载，别只看 `list`。
+- `State.installed = 服务在 launchctl 里 || plist 文件存在`；`State.loaded` 单独记录是否真加载。
+  设置页三态：**已开启 / 待生效（橙）/ 未开启**，未加载时不显示倒计时。
+- **「plist 在、服务掉线」必须有人救，否则完全无声**：这种状态界面显"已开启"却一次都不触发。
+  自愈 = `AppModel.healLaunchdIfNeeded()`（仅 `installed && !loaded` 时重装），两个触发点：
+  ① `start()` 启动后 1.5s ② ticker 每 15 分钟（`logTicks % 900`）。
+  **别再假设"App 启动会自己重装"**：`syncLaunchdIfNeeded()` 只挂在设置页改动上，
+  用户不改设置就永远不修（2026-09-21 事故：App 连开 3 天、服务掉线、连着到点不签）。
+- 验证服务是否真能跑：`launchctl kickstart -k gui/501/<label>`，再看 `logs/launchd.out.log`
+  是否从 0 字节涨起来 —— **该文件为空 = 服务从未成功执行过**，比任何推断都干净。
 
-## 品牌
+## UI 版式
+- 设计稿 `~/Downloads/Design file/01~04 *.png`（1440×900）。**改 UI 先量稿**（PIL），值落 `Theme.swift`，
+  视图层不许魔法数。见 skill `design-spec-to-swiftui`。
+- 参数：顶栏 52 + 主体 816 + 底栏 32；侧栏 240 + 内容 1200；页面 padding 38；卡片白底 1px `#E2E2E2` 圆角 12；
+  页面底**纯白**；表头**黑底通栏**；`.hiddenTitleBar` 自绘顶栏左侧留 78pt；`minWidth 1280`。
+- **行数=账号数 的区块绝不并排概览卡**。三行固定：①概览（高度与账号数无关）②任务表（全宽）③明细。
+- **状态信息只留一个真源**：开关只在顶栏胶囊+设置页；积分总额只在积分卡；连续签到只在总览卡；
+  **「手动签到」只在顶栏**；账号页不要「签到状态摘要」卡。设置页**即时生效无保存按钮**。
+- 侧栏保留 `01~04` 序号；不要「导航」小标题/底部「本地账户」；「今日进度」卡固定侧栏底部。
+- **非积分资源走独立字段**（阿里云盘容量是字节）。滚动图装不下时**不压窄柱子** → 横向滚动 + 锚最新 + 标签稀疏化。
+- SwiftUI 坑：`Menu` 标签忽略内部 `.frame()` → `Button`+`.popover`；`PlatformIcon.image()` 有 34pt 上限；
+  `DatePicker(.field)` 要回车才写回 → 用「时/分」下拉；列表 identity 用带 UUID 的 struct；
+  `syncLaunchdIfNeeded()` 0.5s 防抖。**SF Symbol 名字写错会静默渲染成空白** → 用系统 `name_availability.plist` 校验。
 
-- 设计稿顶栏写的是 `AutoCheck`，但**实际品牌是「喵签签」**，logo 用现有黑猫 AppIcon。
-  用户 2026-09-15 明确选择保持喵签签，不要再改回 AutoCheck。
+## 品牌与文案
+- 品牌「喵签签」（设计稿 AutoCheck 是旧名，用户明确保留），logo 用黑猫 AppIcon。
+- 不照抄设计稿假数据；稿子与代码行为不符时**写真实行为**并在交付说明指出。
+- **输入框标签必须与它接受的格式完全一致**；凭据名词只由 `credentialNoun(for:)` 提供。
+- **「平台没有接口」≠「我们没做」**：B站观看/分享/投币都有接口但本项目不做的，文案要写「本工具未代办」。
 
-## 文案原则
-
-- **不照抄设计稿里的假数据**（「延迟 42ms」「网络正常」等）——换成真实可得的指标。
-- 稿子里的功能描述若与代码实际行为不符，**写真实行为**并在交付说明里指出（例：重试次数）。
-
-## 验证
-
-- 用户要求手动 build，**不要自己跑 `swift build` / 开 App**。
-- 交付前做 `swiftc -parse` + `swiftc -typecheck`（不产出构建产物），见 skill
-  `swift-no-build-verification` 的「SwiftPM 工程」分支。
-
-## 打包
-
-- 用 `bash make_native_app.sh`（5 步：工具链 → swift build → 组装 → 图标 + 平台图标 → **重做 ad-hoc 签名**）。
-- **最后一步的签名不能省。** `swift build` 给中间产物打的签名与最终 `.app` 包结构不匹配，
-  直接 `cp` 会让 `codesign --verify` 退出码 1（`code has no resources but signature indicates they must be present`），
-  arm64 上双击可能被系统拒绝。凡是在 `.app` 里增删文件（Info.plist / 图标）都必须**在其之后**重新签名，
-  否则签名立刻失效。校验：`codesign --verify --strict 喵签签.app` 应输出 `valid on disk`。
-- 打包需写 `~/.swiftpm`，沙盒内会失败，要放开沙盒执行。
-
-## 平台图标
-
-- 目录 `assets/platform-icons/`，现有 5 个：`trae / workbuddy / bilibili / jd / lenovo`。
-  **统一 512×512、满幅**（内容铺满正方形、无透明边距）——留白不一致会让某个图标"看起来更大"，
-  就踩过这个坑：Trae 满幅、WorkBuddy 原本有 10% 留白。圆角由 SwiftUI 统一裁 `size*0.23`。
-- 来源（均免登录，可复现）：
-  - Trae / WorkBuddy：本机 `/Applications/<App>.app/Contents/Resources/*.icns` → `sips` 转 PNG，再去掉透明边距。
-  - Bilibili：`cdn.simpleicons.org/bilibili` 官方品牌矢量白色版 + 品牌粉 `#FB7299` 底合成。
-    SVG 用 Swift `NSImage(contentsOfFile:)` 栅格化（**本机 PIL 不支持 SVG**，`qlmanage` 在沙盒里会失败）。
-  - 京东：iTunes Search API 的官方 App 图标（`artworkUrl512` 中的 `512x512bb` 换成 `1024x1024bb`）——Simple Icons 没有 jd。
-  - 联想：官网 `www.lenovo.com.cn/favicon.ico` 取最大帧放大 + `ImageFilter.UnsharpMask` 锐化。
-    ⚠️ 试过矢量字标（simple-icons lenovo）：34pt 下白字糊成一个白块，**不如 favicon 的"红底白 L"清晰**。
-- 加新平台：转好 PNG 丢进该目录即可，打包脚本用 `*.png` 通配自动带上（**必须在重做签名之前**）。
-- 代码侧统一走 `PlatformIcon.image(_:)`（先 main bundle、再回退工程 assets），取不到回退首字方块。
-- 账号分组与头像图标**同源于 `Account.platformIconName`**，不要在视图里另写一套平台判断。
-
-## 侧栏 / 顶栏 / 页面元素约定（2026-09-15 用户确认）
-
-- 侧栏**要保留 `01~04` 序号**：当天上午删过，晚上用户要求恢复，**别再删**。
-  样式：编号（26pt 宽，选中转红 `Theme.accent`）→ 图标（22pt 宽）→ 文字，leading 12。
-- 不要「导航」小标题；底部不要「本地账户 / 免费版」块；「今日进度」卡固定在侧栏最底部。
-- 顶栏 logo + 「喵签签」必须在 240pt 侧栏宽度内**居中**（光学中心落在 120pt 中线），交通灯用背景拖拽区让开。
-- **「手动签到」按钮只在顶栏保留一处**，签到页 PageHeader 里不再重复放（用户要求去掉）。
-- **账号管理页不要「签到状态摘要」卡**（签到进度属于签到页，与账号管理无关）。
-  该页右侧栏现在只承载 `AddAccountPanel`，面板收起时整栏不占位、列表铺满整宽。
-
-## 添加账号面板结构（2026-09-15，同日两次收敛）
-
-- **两个分段**：浏览器登录 / 凭据导入。曾短暂是三项（把 WorkBuddy 单列），用户指出
-  "扫码登录说白了就是浏览器登录"——都是"弹内置浏览器 → 登录 → 抓登录态"，故并入平台下拉。
-- 「浏览器登录」平台下拉：**WorkBuddy / Trae / Bilibili / 联想智选 / 京东**，按 `LoginKind` 分派：
-  - `.workbuddy` → `runWorkBuddyOAuth`（`workbuddy_login.py`）
-  - `.trae` → `runTraeLogin`（`trae_login.py`）
-  - `.cookie` → `runCookieBrowserLogin`（`browser_login.py --platform <type>`）
-- 各平台带**次级路径**（都不弹浏览器，与主按钮并列在下方）：
-  - WorkBuddy → 「或读取本机桌面端登录态」`workbuddyLocalSection`
-  - Cookie 型 → 「或手动粘贴 Cookie」`manualCookieSection`
-  - Trae → 无（粘贴入口在「凭据导入」）
-  ⚠️ `addCookieAccount` 写 `{type}_auth`，`addAccountCurl` 写 `requests`，**语义不同，不能互相替代**。
-- 「凭据导入」保持通用（TRAE / WORKBUDDY / CURL / 其他 + 粘贴 Cookie/Token）。
-- 平台下拉图标 14pt（曾用 16pt，用户反馈 Trae 显得太大）。
-
-## 账号名称自动命名（2026-09-15）
-
-用户要求"不填名称就自动读真实名称"。三个脚本的 `--name` 均已改为**可选**，留空即自动命名：
-
-| 脚本 | 能否拿到真实昵称 | 自动命名规则 |
+## 平台清单与凭据字段
+| type | 平台 | 凭据字段 |
 |---|---|---|
-| `browser_login.py` | **能** —— 三个平台的只读验证函数本来就返回 nickname | 昵称 → uid → `<platform>-auto`，如 `bilibili-小明` |
-| `workbuddy_login.py` | **能** —— OAuth 的 `fetch_account()` 返回 nickname | 本来就用昵称命名 |
-| `trae_login.py` | **不能** —— JWT payload 只有 `data.id`（16 位数字），`trae_api` 也无用户资料接口 | 账号 ID 后 6 位，如 `trae-123456` |
+| `trae` | Trae | `trae_auth.token` + `.session` |
+| `workbuddy` | WorkBuddy | `workbuddy_auth`（OAuth device flow） |
+| `bilibili` | Bilibili | `bilibili_auth.cookie`（签到走漫画接口） |
+| `lenovo` | 联想智选 | `lenovo_auth.cookie`（服务端抖动，必须重试） |
+| `smzdm` | 什么值得买 | `smzdm_auth.cookie` |
+| `aliyunpan` | 阿里云盘 | `aliyunpan_auth.refresh_token` |
+| `caimcloud` | 中国移动云盘 | `caimcloud_auth.authorization`（= `<授权码>#<手机号>`） |
+| `jd` | 京东 | 平台侧已停用 |
 
-- 别去猜"Trae 也能读昵称"——已查证过 JWT payload（`['data','exp','iat']` → `data` 只有
-  `['id','source','source_id','tenant_id','type']`）与 `TraeClient` 全部方法。
-- 名称留空时浏览器 profile 目录用 `_auto` 占位（`<platform>/_auto`）。
-- Swift 侧对应的硬校验（`请输入账号名称`）已全部移除；`loginAccount` 显示 `(自动命名)`。
+- 字段名唯一真源：`cookie_manager.CREDENTIAL_FIELD` / Swift `AppModel.credentialField(for:)` / `credentialNoun(for:)`。
+- 登录浏览器统一内置 Chromium：WorkBuddy 一次性干净 profile；Trae/Cookie 型按平台+账号持久 profile；
+  Playwright 缺失要保留回退。同步窗口要在轮询间隙驱动（`tick` 里 `page.wait_for_timeout()`），
+  关窗抛 `BrowserClosed`（退出码 2）。
+- **验证接口不需要真凭据**：带假凭据打一发，从错误形态分辨端点不存在/参数缺失/凭据无效/签名不对。
+- **WorkBuddy 账号有两种来源，行为完全不同**（`workbuddy_auth.source`）：`oauth`（扫码登录，
+  凭据自带在 accounts.json，**与桌面端无关**）/ `local`（从本机登录态一键读取，凭据只有桌面端有）。
+  桌面端状态**只影响 local**。判据唯一真源 `AppModel.workbuddyReloginUsesOAuth(_:)`
+  ——`relogin()` 的路由与按钮文案都调它。⚠️ 别再拿 `wbHealthy == false` 一刀切判 WorkBuddy 健康，
+  那会在桌面端未登录/加密时给 oauth 账号**永久误报**。
+- **桌面端 2026-09-24 起把凭据改成加密存储**（`$wbEncrypted` 信封，密钥在不落盘的原生模块里）
+  → `local` 来源的账号**读不到明文，只能改走扫码登录**。细节在 `platforms.md` 的 WorkBuddy 一节。
 
-## 运行环境（重要）
+## 新增凭据型平台的固定改动面
+**6 步清单在 `platforms.md` 末尾**（新建 `<platform>.py` → `checkin.py` 注册 → `Models.swift` →
+`AppModel.swift` → `ViewAccounts.swift` → 图标资源）。`LoginKind.manual` = 无浏览器抓取路径（当前无平台使用）。
 
-- Swift 侧 `Py.detect()`（`Bridge.swift`）挑解释器的顺序：`CHECKIN_PYTHON` 环境变量 →
-  **Marvis runtime 的 python311** → homebrew → `/usr/local` → `/usr/bin`。
-- 实机命中 `~/Library/Application Support/com.tencent.mac.marvis/components/MarvisAgent/Versions/<ver>/runtime/python311/bin/python3`
-  （Python 3.11.9）。**`playwright` 只装在这个解释器里**；系统 `/usr/bin/python3` 和托管 python 都没有。
-- 所以改完 Python 脚本，验证要用这个解释器——否则会得到"playwright 不可用"的错误结论。
-- `~/Library/Caches/ms-playwright/` 已有 chromium，内置浏览器可直接用。
+## 签到内核
+- **四态**：成功 / 平台受限（对方活动下线、cookie 好）/ 失败（cookie 失效、网络错）/ **平台已停用**。
+  `_RETIRED_PLATFORMS`（Py）↔ `Account.isRetiredType()`（Swift）**必须同口径**；停用平台不产生任何记录、
+  不进新增面板、账号行显「平台已停用」（别与「已停用」混），已有账号仍可查看/改凭据/删。
+  `activeAccounts()` 是**唯一进度统计口径**。
+- **去重 = 平台原生预检 + 本地台账** `logs/checkin_state.json`（14 天、不含凭据、`--force` 忽略）。
+  Swift `ParsedLogs.looksAlreadySigned()` 与 Python `checkin.is_already_msg()` 必须同口径。
+- **日志文案**：`[FAIL]` 前缀「签到失败：」由 `checkin.py` 统一加（平台模块不要再带）；成功文案要能被两侧正则取到数字。
+- **对方"服务端抖动"先怀疑多实例会话不粘 → 重试**，别急着改参数。判据：真实浏览器复现同样失败率。
 
-## 登录浏览器策略（2026-09-15）
+## 子任务图标（任务表「今日任务」列）
+- 唯一真源 **`subtasks.py`**，五态：`done`（本次有收益）/ `idle`（无需动作）/ `running` / `fail`（尝试未成功）/
+  `na`（界面不渲染）。**`done` vs `idle` 看"这次有没有动"，不是"满不满意"**（"本期已领取"记 idle）。
+- **台账每条记录加 `tasks` 字段**（结构化落盘），Swift 读它渲染——**不解析被截断到 160 字的 message**
+  （"哪一步失败"最先被切掉）。读写两侧都过 `subtasks.normalize()` 收敛脏数据。
+- ⚠️ 成长中心类接口**内部动作失败也可能返回 `ok=True`**（ok 只表示查询跑通）→
+  `from_step(fail_markers=("失败","失效"))` 命中文案才算 fail，否则会把"开盲盒失败"画成绿勾。
+- **每个非 done 状态都必须能解释自己**：`idle` 的图标是灰的，不给原因用户就只会看到"一直是灰的"
+  而无法判断是"真没得做"还是"我们解析错了"。做法：步骤函数多返回一项 `note`（第 4 项），
+  只进 `task.detail`（tooltip）、**不进 steps/日志**（纪律：稳态静默）。`note` 以 `running_prefix`
+  开头时判 `running` —— 进行态既能保住橙图标、又不必写日志。**并把读到的原值写进 note**
+  （"入门 未读到"/"读到 0 条任务"）：字段名被服务端改掉时，tooltip 自己就会喊出来。
+- Swift：`SubTasks.swift`（`SubTask` / `SubTaskStore` / `TaskIconStrip`）+ `Theme.taskColors()`。
+  **形状=哪个任务，颜色=结果状态**；`na` 不渲染；子任务 < 2 个（单动作平台）整列留空；最多 7 个、超出收 `+N`；hover 出 tooltip。
 
-- **统一走内置 Chromium（Playwright）**，不再占用用户日常浏览器。原 `workbuddy_login.py` 走
-  `webbrowser.open()` 调系统默认浏览器，用户指出"扫码登录还是调的普通浏览器，该统一一下"。
-- WorkBuddy（device flow，不依赖持久登录态）：**每次全新干净 profile**，用完即弃。
-- Trae / Cookie 型平台：保留按「平台+账号」隔离的**持久 profile**（`.browser_state*/`），
-  避免每次重新扫码。用户若要求"完全不记住"，改这两处 `launch_persistent_context` 即可。
-- `workbuddy_login.py` 新增 `--browser auto|embedded|system`（默认 `auto`：内置优先、不可用回退系统浏览器）。
-  **Playwright 缺失时的回退路径必须保留**，不能直接报错。
-- 实现要点：Playwright sync API 的窗口必须在轮询间隙被"驱动"，否则会卡死。
-  `poll_token(state, timeout, tick=...)` 的 `tick` 回调里调 `page.wait_for_timeout()` 驱动事件循环；
-  用户关窗时 `tick` 抛 `BrowserClosed` 中断轮询（脚本退出码 2）。
+## 积分口径
+- `checkin.py --credits --json` 用 `print`（**不能用 `log()`**，会被当签到记录）输出一行
+  `[CREDITS_JSON] {date,total,counted,items:[…]}`；Swift `parseCreditsOutput` 取最后一条（stdout+stderr 拼接）。
+  统一口径 = **账号当前可用余额**，`unit` 必须标。
+- WorkBuddy 端点表在 `platforms.md`（签到类带 `/v2`、资源类不能带，别写混）。
 
-## Trae 的 JWT 必须自动续期（2026-09-15 修的真 bug，极其重要）
+## 异常呈现
+- 「签到结果与异常」卡按**账号逐条**：`AppModel.issueItems() -> [CheckinIssue]`（fail + restricted，含账号名与原始 LogHit）。
+- 点条目 → `IssueDetailSheet`：完整报错原文（可选中）+ 时间 + `diagnose()`（relogin/retry/wait/none）+ 账号信息 +
+  「重试签到」（`checkin.py --only <name>`）+ 复制报错。**弹窗存账号名不存条目对象**。
+- **诊断给出什么建议，就必须在建议指向的页面有可执行入口**，否则是逻辑漏洞（smzdm 签到失败 →
+  弹窗说"请重新登录"、账号页却只有重命名/删除，用户无处可点）。落点：`needsRelogin(_:)` 是**唯一判据**
+  （今天失败且 `diagnose().fix == .relogin`，**或** `credentialHint()` 报红）；`canRelogin(_:)` 判平台有无本机登录路径；
+  `relogin(_:)` 按平台路由并**沿用账号名**（同名只更新凭据、不新增账号、不动启用状态）。
+  入口 = **账号行报错那一行末尾的灰色 chip**（不是操作列、不用红色胶囊）；跳账号页要设 `focusAccount` 高亮
+  （**先切页再设**，反了会被 `selectedPage` 的 didSet 清掉）。
+- `credentialHint()` 只判"字段填没填"，**不能当成"凭据还能用"**——Cookie 过期了它照样报绿。
+- **「换了凭据」≠「改了状态」**：状态胶囊 / 健康卡 / 「重新登录」入口**全部从当天的签到日志推出来**，
+  而登录动作**不写日志**。所以任何"重新登录 / 刷新登录态"成功分支都**必须以真签一次收尾**
+  （`AppModel.verifyAfterRelogin(_:)`），否则界面会继续复述上午那条 FAIL，看起来像"重新登录没生效"
+  ——用户 2026-09-24 报的就是这个。`loadAccounts()` 只刷凭据快照，**刷不了状态**。
+  该函数四条分支**都必须给反馈**（扫码成功却一声不吭，用户照样以为没成功）；
+  今天已签 / 已停用 / 未启用 / 有签到在跑 → 跳过真签但要说明。
 
-**现象**：Trae 白天签到全部失败（`HTTP 200，错误码 1001`：not able to authenticate you），
-积分查询全部 `HTTP 401` → 界面「积分状态」显示 0。
-
-**根因**：`TraeClient` 用 `token = self.token or self.get_token()`。`run_trae_acc` / `run_credits`
-都会把 `accounts.json` 里存的 JWT 传进来，于是 `self.token` 非空，**永远不会走 `get_token()`**。
-而 JWT 只有约 8 小时有效期（长效的是 `X-Cloudide-Session`，约 14 天）。
-→ 当天换过一次 token 后，8 小时后开始全灭。日志证据：00:00 成功、09:22 起 401/1001。
-
-**修法**：`trae_api.py` 新增 `_post_authed(path, body)`，三个接口（`credits` / `status` / `checkin`）
-统一走它：命中鉴权失败就用 session 重换 JWT 并**重试一次**。
-- 鉴权失败判定 `_is_auth_failure`：`HTTP 401/403` **或** 业务码 `1001/1002`
-  （Trae 过期后返回 HTTP 200 + code 1001，只看 HTTP 状态码会漏判）。
-- 无 `session` 时不重试（避免无意义的失败）；一次就成功时不多换 token。
-- 返回值带 `refreshed_token` 便于排查。
-
-**Trae 状态接口的真实响应**（实测，只读）：
-`{"checked_in": true, "code": 0, "credits": 150, "did_checked_in": true, "enable": true, "extra_credits": 50, "message": "success"}`
-- 这里面 `credits` 是**今日签到奖励**，不是账户可用余额（余额要查 `pay/user_current_entitlement_list`）。
-  所以跳过文案里不要写"累计 N 积分"，会被误读。
-- `TraeClient.status()` 的字段名容错：按 key 优先级全局匹配
-  （`checked_in` → `today_checked_in` → … → `signed`），**key 优先于深度**，
-  避免深层同名布尔字段抢先命中。`known=False` 表示判不出来。
-
-## 签到去重：本地台账 + 各平台原生预检（2026-09-15 用户要求）
-
-用户原话："每次都是批量签，他们没有检测到我已经签过就不签了。"
-各平台"今日是否已签到"的只读接口覆盖不全，所以做了两层：
-
-1. **原生预检**（有则先用）：Trae（`status()` 读 `checked_in`）、WorkBuddy（`today_checked_in`）、
-   联想（`signed_today(cfg)`）。Bilibili / 京东**没有**公开只读接口。
-2. **本地台账** `logs/checkin_state.json`：`{日期: {账号名: {platform, ok, credits, message, at}}}`，
-   只保留最近 14 天，**不含任何 token/cookie**。签到前若今天已成功 → 直接跳过、记为已签到、不发请求。
-   `--force` 可忽略台账强制重签。
-
-- 预检判不出来时**照常签到**（宁可多发一次请求，也绝不漏签）——这是安全方向。
-- Swift 侧按描述文案判定是否"已签到"：`ParsedLogs.looksAlreadySigned()` 与 Python 的
-  `checkin.is_already_msg()` **必须同口径**（`已签到` / `无需重复` / `跳过重复`），改一处要同步另一处。
-- `LogHit.skipped` → 签到表状态胶囊显示「已签到」（而非「已完成」），今日积分列显示 `—`。
-
-## 积分数据：机读 JSON 通道（不要用正则啃中文文案）
-
-各平台文案格式不一致，原 `AppModel.matchCredits` 用正则匹配（`总限额`/`已用`/`剩余`）**只有 Trae 能命中**，
-其余平台全部落空。现改为：
-
-- `checkin.py --credits --json` 额外用 `print` 输出一行 `[CREDITS_JSON] {...}`：
-  `{date, total, counted, items:[{name, app, type, label, unit, ok, balance, used, limit, streak_days, state, summary, message}]}`
-- **必须用 `print` 而不是 `log()`**：`log()` 会加时间戳并写进 `checkin.log`，
-  而 `ParsedLogs` 会把它当成签到记录解析。
-- Swift 侧 `AppModel.parseCreditsOutput` 只认这一行（取 `last(where: hasPrefix)`，
-  因为 `runPythonCapture` 返回的是 `stdout + stderr` 拼接）。
-- 统一口径 = **账号当前可用余额**：Trae 剩余积分 / B站硬币 / 联想乐豆 / 京东无接口(留空) /
-  WorkBuddy 的 `checkin-status.credit`（实测恒为 0，故留空显示"未提供"）。
-  **各平台单位不同，`unit` 字段必须标明**；界面「账号积分总额」= 所有启用账号 balance 之和，
-  下方给出逐账号明细便于核对（这也是发现 401 的入口）。
-- `workbuddy-悱` 这类**没有 `access_token` 的本机登录态账号**，查询依赖本机桌面端登录文件；
-  在沙盒里跑会出 "未找到 WorkBuddy 登录态文件"，属测试环境假象，不是代码问题。
-
-## SwiftUI 约定：`Menu` 标签里不要放 Image（会忽略 .frame()）
-
-- **现象**：「新增账号」面板里选平台的下拉，图标被渲染成 **512pt**，整个面板被撑到 ~550pt，
-  左侧账号列表被挤到 391pt 而裁切（五列需要 ≥506pt），底部冒出横向滚动条。
-- **原因**：SwiftUI 的 `Menu`（`.menuStyle(.borderlessButton)`）标签会按内容**固有尺寸**布局，
-  **忽略标签内容里的 `.frame()`**。`NSImage` 的固有尺寸 = 自然点尺寸，
-  而 `workbuddy.png` 是 512×512 @72dpi → 512pt。（`trae.png` 256px@144dpi → 128pt。）
-- **实测数字**：`.workbuddy/tools/probe_layout.swift`（`xcrun swift` 直接跑，不用 build）
-  → Menu 标签内置图标 **548 × 512**；换 Button 后 **88 × 32**。
-- **修法**：改用 `Button { … } label: { … }.buttonStyle(.plain)` + `.popover` 自建下拉
-  （`ViewAccounts.platformMenu`）。实测 Button 标签严守 frame：内容 89×32，与设计稿一致。
-- **兜底**：`PlatformIcon.image()` 里 `clampPointSize()` 把点尺寸压到 ≤34pt。
-  以后哪个视图再漏 `.frame()`，最多偏大一点，不会破坏布局。
-- 设置页那几个 `Menu` 的标签只有 `Text`，不受影响，不用改。
-- 顺带：项目窗口 `minWidth: 1280`、侧栏 240pt、页面留白 38pt×2。
-  可用宽度 = 窗口 − 240 − 76；`HStack` 里列表面板间距 23pt、面板固定 358pt。
-  改布局时按这套数字复算，别凭感觉。
-
-## 平台登录态校验：接口会失效，必须能"判不了"
-
-`browser_login.py` 的 `verify()` 返回 **三态** `(state, nickname, uid, message)`：
-
-| state | 含义 | 处理 |
-|---|---|---|
-| `ok` | 平台明确说已登录 | 立即保存、关窗 |
-| `pending` | 平台明确说还没登录 | 继续等 |
-| `unknown` | 接口改版/风控/网络异常 | 连续 3 次（`UNKNOWN_ACCEPT_STREAK`）→ 按「关键 Cookie 已捕获」保存 |
-
-再加一道 `CAPTURE_GRACE_SECONDS=120`：关键 Cookie 到手后最多再等 120s 做只读复核。
-**只写 `pending`/`ok` 两态是错的** —— 平台接口一改版就会死等 600s、浏览器还挂着不关（踩过两次）。
-
-各平台只读接口现状（**换接口前先实测一遍再写**）：
-
-- 京东：`api.m.jd.com/client.action?functionId=signBeanIndex&appid=ld` →
-  未登录 `{"code":"3","errorMessage":"用户未登录"}`，有效 `code=="0"`，顺带带京豆余额。
-  **旧 `passport.jd.com/user/petName/getUserInfoForMini609.action` 已废**（返回 186KB 首页 HTML）。
-  `signBeanAct`（签到）对无效 cookie 返回 402「挤不进去」，**不是**登录信号。
-  该接口本身不稳（同一请求一会儿 200 一会儿 403）。
-- 联想：签到页 `$CONFIG` 已改成 `$CONFIG = {}` + **逐行 `$CONFIG.key = 值`**，
-  别再写「匹配一个对象字面量」的正则；且**未登录页面同样有 $CONFIG 和 token**，
-  必须用 `_is_logged_in()`（`lenovoId`/`loginName`/`signState`）区分。
-- 解析 JS 赋值：值模式要收紧（带引号串 或 `[^\s;<>]*`），最后一项常常**没有分号**，
-  写宽了会吞掉后面的 `<script>`/CSS。
-
-其它约定：账号名兜底用 `pt_pin` 时手机号只留尾 4 位（`_mask_pin`），不要把手机号显示到界面上。
-
-## 签到结果必须是三态：成功 / 平台受限 / 失败
-
-**「平台受限」= 平台侧不可用（活动下线、接口迁移、风控），账号和 cookie 都是好的。**
-绝不能混进「失败」——否则用户会看到一个红色"签到失败"，跑去反复重新登录一个
-本来好的账号；而且"失败自动重试"会反复去打对方接口。
-
-- 平台客户端 `checkin()` 返回 `restricted: bool`；
-- `checkin.py`：`run_cookie_acc` → `(ok, desc, restricted)`，统一走 `_report_result()`
-  打 `[OK]` / `[受限]` / `[FAIL]`；汇总行加「平台受限 N」；只有 fail 让 exit≠0；
-- `Models.swift`：`restrictedByDay` 桶，`status()` 优先级 **成功 > 受限 > 失败**，
-  **`todayFail()` 必须排除受限账号**（否则重试逻辑反复重试）；
-- UI 用 `Theme.warn`(橙) / `Theme.warnSoft`，文案「平台受限」；
-- `AppModel.runSignSequence` 的实时刷新条件是 `[OK]`/`[FAIL]`/`[受限]` 三者。
-
-判据口诀：**cookie 失效、网络错误是"失败"；对方活动没了是"受限"。**
-
-## 各平台签到接口现状（2026-09 实测，改动前先自己实一遍）
-
-- **Bilibili**：`GET /x/member/web/exp/reward`（成长中心→每日任务→登录 的领取接口）。
-  ⚠️ 旧的 `/x/web-interface/checkin` **不存在**（404 返回 HTML 错误页），别再用。
-  B站已取消独立签到入口，每日登录经验 +5（单位是**经验**，不是硬币）。
-  幂等：`data.login` 为 true 即"今日已领"。未登录有两个码：无/空 SESSDATA → `-101`；
-  **非法 SESSDATA → `-400 请求错误`（HTTP 200）**，必须再用 `nav()` 复核才能定性。
-- **京东**：京豆签到**活动已下线**（`bean.m.jd.com` 302 到错误页；`signBeanAct` 对未
-  签名请求恒返回 402「活动现在挤不进去呀」或 `code=0+errorCode=S109`；换 appid/client/
-  body 全无效，需要 h5st 签名）。只读 `signBeanIndex` 仍可用于**校验登录态**
-  （未登录 `code=3`），但已返回 `errorCode=DG-9999 系统异常`，**拿不到京豆余额**。
-  **⚠️ `code=="0"` 不等于成功**：务必先看 `errorCode` 非空且 ≠"0" → 归为失败/瞬时，
-  否则会把 S109 误报成"今日已签到（幂等）"。
-- **联想**：签到页 `$CONFIG` 的逐行赋值写法见上一条；未登录页同样有 `$CONFIG`。
-
-## 日志/文案约定
-
-- `[FAIL]` 行里的文案由 `checkin.py` 统一加「签到失败：」前缀，
-  **平台客户端自己的 message 不要再带这个前缀**（否则会出现"签到失败：签到失败："）。
-- 成功行想被 Swift 的 `extractCredits` 和 Python 的 `credit_from_message` 取到数字，
-  文案要写成「…，本次获得 N 积分（京豆/经验…）」这种形状
-  （正则：`(?:本次获得|累计|共)\s*([\d.]+)\s*(?:积分|经验|京豆|乐豆|硬币)`）。
-
-## 工具/协作坑
-
-- **不要在同一条消息里对同一个文件发两个 Edit** —— 会互相覆盖（本轮踩了两次：
-  `_report_result` 定义和汇总行都被悄悄吞掉，编辑还报"成功"）。改完要 grep 复核。
-- zsh 下 `grep "a\|b"` 这类 BRE 交替经常静默返回空，用带 `-n` 的专用搜索工具更稳。
-
-## 新增账号面板：只有「浏览器登录」一条主入口
-
-面板结构（`AddAccountPanel`，2026-09-15 定型）：
-
-- **主路径**：平台下拉（WorkBuddy / Trae / Bilibili / 联想 / 京东）→「打开登录浏览器」。
-  账号名称可留空，脚本自动命名（昵称 → 账号 ID → auto）。
-- **次级路径**（同一表单内、分隔线以下，不弹浏览器）：
-  WorkBuddy →「读取本机桌面端登录态」；B站/联想/京东 →「或手动粘贴 Cookie」；Trae → 无。
-- 「**凭据导入**」（cURL 抓包导入）**已删除，不要再加回 GUI**。它是 Trae 早期没有原生客户端
-  时的遗留物：收一整条 cURL、存成 `requests[]` 原始 HTTP 请求、签到时照原样重放。
-  被删的三条理由：① 与「手动粘贴 Cookie」在用户视角重复；② 输入框标签写「Cookie / Token」
-  但 `parse_curl()` 只认 cURL，粘 Cookie **不报错**、静默存成 `GET SESSDATA=…` 的必失败账号；
-  ③ 实测 7 个账号无一使用（`accounts.json` 里 `requests` 字段出现 0 次）。
-
-**通用判据：一个输入框的标签必须和它接受的格式完全一致；不一致就先修，修不动就删。**
-"标签写 A、代码只吃 B、还静默成功"是最坏的一类入口。
-
-凭据落盘位置（改 UI 时别搞混）：
-
-| 平台 | 存哪 | 谁读它 |
-|---|---|---|
-| Trae | `<name>.trae_auth`（JWT + X-Cloudide-Session） | `trae_api.py` |
-| WorkBuddy | `<name>.workbuddy_auth`（accessToken/refreshToken） | `workbuddy.py` |
-| B站 / 联想 / 京东 | `<name>.<platform>_auth.cookie` | `bilibili.py` / `lenovo.py` / `jd.py` |
-| cURL 抓包型（仅 CLI） | `<name>.requests[]` | `checkin.py` 的 `send_request()` 分支 |
-
-cURL 能力没完全消失，但只剩两条**非 GUI**路径：`curl_to_account.py` 命令行，
-以及账号管理页的「导入账号文件」（`AppModel.importAccounts`，支持 JSON 或每行一条 cURL）。
-
-其余约定：平台图标用 `PlatformIcon.image()`（有 34pt 上限兜底）；平台下拉用
-`Button` + `.popover`，不要用 `Menu`（会忽略标签内的 `.frame()`）。
+## 协作坑
+- **同一条消息里对同一文件发两个 Edit 会互相覆盖**（都报成功，前一次静默丢弃）→ 串行，或一次大 Edit，改完 grep 复核。
+- zsh 下 `grep "a\|b"` 常静默返回空 → 用专用搜索工具，或拆成多条 grep。
+- 临时探测脚本放 `/tmp`，别留项目根。

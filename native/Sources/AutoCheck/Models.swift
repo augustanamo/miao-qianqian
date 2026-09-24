@@ -9,9 +9,12 @@ struct TraeAuth: Codable, Hashable {
     var saved_at: String?
 }
 
-/// WorkBuddy 账号快照（仅非敏感字段）。
-/// accessToken 等同账号密码，**绝不**写入 accounts.json / 日志 / UI，
-/// 签名时实时从本机登录态文件读取（见 workbuddy.py）。
+/// WorkBuddy 账号的登录态快照。**两种来源，别混为一谈**（见 `source`）：
+///   · "oauth"（扫码登录）：access_token / refresh_token 就存在这里
+///     （accounts.json 已被 .gitignore 排除），与桌面端完全无关；
+///   · "local"（从本机登录态一键读取）：只有非敏感快照，token 不落盘，
+///     签名时实时从桌面端凭据文件读 —— 所以它的真源是**桌面端**。
+/// token 等同账号密码：绝不写日志、绝不在界面回显明文。
 struct WorkBuddyAuth: Codable, Hashable {
     var uid: String?
     var nickname: String?
@@ -22,22 +25,37 @@ struct WorkBuddyAuth: Codable, Hashable {
     var source: String?   // "local"=本机登录态一键读取；"oauth"=扫码登录
 }
 
-/// Cookie 型平台账号快照（Bilibili / 联想智选 / 京东等，仅非敏感字段）。
-/// cookie 等同账号密码：Swift 侧只透传用户粘贴的 cookie 到 Python 落盘，
-/// 展示与日志一律使用脱敏摘要，绝不回显 cookie 明文。
+/// Cookie 型平台账号快照（Bilibili / 联想智选 / 京东 / 什么值得买 / 阿里云盘，
+/// 仅非敏感字段）。
+/// 凭据等同账号密码：Swift 侧只透传用户粘贴的凭据到 Python 落盘，
+/// 展示与日志一律使用脱敏摘要，绝不回显明文。
+///
+/// 两个凭据字段的区别——`cookie` 是 HTTP Cookie 串；`refresh_token` 是
+/// 阿里云盘那种"登录态令牌"（存在浏览器 localStorage 里，不是 Cookie）。
+/// 分开存是为了让字段名和内容对得上，不再出现"标签写 Cookie、实际存的是
+/// 令牌"那种静默错配。
 struct CookieAuth: Codable, Hashable {
     var cookie: String?
+    var refresh_token: String?
     var nickname: String?
     var uid: String?
     var saved_at: String?
     var updated_at: String?
 
+    /// 实际持有的凭据值（两者取其一）
+    var credential: String {
+        let rt = (refresh_token ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !rt.isEmpty { return rt }
+        return (cookie ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     var summary: String {
-        guard let c = cookie, !c.isEmpty else { return "(空)" }
+        let c = credential
+        if c.isEmpty { return "(空)" }
         if c.count <= 12 { return "******" }
         return String(c.prefix(8)) + "******"
     }
-    var isConfigured: Bool { !(cookie ?? "").isEmpty }
+    var isConfigured: Bool { !credential.isEmpty }
 }
 
 struct ReqConf: Codable, Hashable {
@@ -58,6 +76,9 @@ struct Account: Codable, Identifiable, Hashable {
     var bilibili_auth: CookieAuth?
     var lenovo_auth: CookieAuth?
     var jd_auth: CookieAuth?
+    var smzdm_auth: CookieAuth?
+    var aliyunpan_auth: CookieAuth?
+    var caimcloud_auth: CookieAuth?
 
     var id: String { name }
     var isEnabled: Bool { enabled ?? true }
@@ -66,13 +87,40 @@ struct Account: Codable, Identifiable, Hashable {
     var isBilibili: Bool { type == "bilibili" }
     var isLenovo: Bool { type == "lenovo" }
     var isJd: Bool { type == "jd" }
+    var isSmzdm: Bool { type == "smzdm" }
+    var isAliyunpan: Bool { type == "aliyunpan" }
+    var isCaimcloud: Bool { type == "caimcloud" }
+    /// 走「浏览器登录 / 粘贴凭据」这条路的平台
+    var isCredentialPlatform: Bool {
+        isBilibili || isLenovo || isJd || isSmzdm || isAliyunpan || isCaimcloud
+    }
+
+    /// 该平台在**平台侧**是否已停用（对方整条链路都挂了，我们怎么改客户端都签不上）。
+    /// 这不等于"账号不可用"：已有账号仍可查看、可更新凭据、可删除，只是不再自动签到，
+    /// 也不再产生橙色「平台受限」记录（那会变成每天都挂一条的无意义噪音）。
+    /// 目前只有京东——京豆签到整条链路已下线，连只读的 signBeanIndex 都回
+    /// errorCode DG-9999「系统异常」。判据见 checkin.py 的 _RETIRED_PLATFORMS。
+    static func isRetiredType(_ t: String?) -> Bool { t == "jd" }
+    var isRetired: Bool { Self.isRetiredType(type) }
+
+    /// 本平台凭据的中文名。**必须与字段里真实存的东西一致**：阿里云盘存的是
+    /// refresh_token、移动云盘存的是 authorization 授权码，都别叫成 Cookie，
+    /// 否则用户会照着标签粘错东西，而且还不报错。
+    var credentialNoun: String {
+        if isAliyunpan { return "刷新令牌" }
+        if isCaimcloud { return "授权码" }
+        return "Cookie"
+    }
     var platformLabel: String { app.isEmpty ? "?" : app.uppercased() }
 
-    /// Cookie 型平台对应的 auth 快照字段（取本平台 cookie 配置，其它平台返回 nil）
+    /// 凭据型平台对应的 auth 快照字段（其它平台返回 nil）
     var cookieAuth: CookieAuth? {
         if isBilibili { return bilibili_auth }
         if isLenovo { return lenovo_auth }
         if isJd { return jd_auth }
+        if isSmzdm { return smzdm_auth }
+        if isAliyunpan { return aliyunpan_auth }
+        if isCaimcloud { return caimcloud_auth }
         return nil
     }
 
@@ -84,12 +132,18 @@ struct Account: Codable, Identifiable, Hashable {
         if isBilibili { return "bilibili" }
         if isLenovo { return "lenovo" }
         if isJd { return "jd" }
+        if isSmzdm { return "smzdm" }
+        if isAliyunpan { return "aliyunpan" }
+        if isCaimcloud { return "caimcloud" }
         let a = app.lowercased()
         if a.contains("trae") { return "trae" }
         if a.contains("workbuddy") { return "workbuddy" }
         if a.contains("bilibili") || a.contains("bili") { return "bilibili" }
         if a.contains("lenovo") || a.contains("联想") { return "lenovo" }
         if a.contains("jd") || a.contains("京东") { return "jd" }
+        if a.contains("smzdm") || a.contains("值得买") { return "smzdm" }
+        if a.contains("aliyunpan") || a.contains("阿里云盘") { return "aliyunpan" }
+        if a.contains("caimcloud") || a.contains("移动云盘") || a.contains("139") { return "caimcloud" }
         return nil
     }
 
@@ -104,13 +158,13 @@ struct Account: Codable, Identifiable, Hashable {
 
     /// 凭证健康：token/session 缺失、无法解析或已过期，一律视为需要重新登录
     func credentialHint() -> (text: String, color: ColorProxy)? {
-        if isBilibili || isLenovo || isJd {
+        if isCredentialPlatform {
             guard let auth = cookieAuth else {
-                return (text: "Cookie 未配置，请更新", color: .red)
+                return (text: "\(credentialNoun)未配置，请更新", color: .red)
             }
             return auth.isConfigured
-                ? (text: "Cookie 已配置", color: .green)
-                : (text: "Cookie 未配置，请更新", color: .red)
+                ? (text: "\(credentialNoun)已配置", color: .green)
+                : (text: "\(credentialNoun)未配置，请更新", color: .red)
         }
         guard isTrae else { return nil }
         let token = trae_auth?.token ?? ""
@@ -148,11 +202,11 @@ struct Account: Codable, Identifiable, Hashable {
 extension Account {
     /// 表格副标题用的凭据摘要（只暴露脱敏摘要，不含任何完整凭据）
     func credentialSummary() -> String {
-        if isBilibili || isLenovo || isJd {
+        if isCredentialPlatform {
             let auth = cookieAuth
             if let n = auth?.nickname, !n.isEmpty { return n }
-            guard let a = auth else { return "Cookie 未配置" }
-            return a.isConfigured ? "Cookie \(a.summary)" : "Cookie 未配置"
+            guard let a = auth else { return "\(credentialNoun)未配置" }
+            return a.isConfigured ? "\(credentialNoun) \(a.summary)" : "\(credentialNoun)未配置"
         }
         if isWorkBuddy {
             let n = workbuddy_auth?.nickname ?? ""
@@ -183,6 +237,78 @@ struct LogHit: Hashable {
     var credits: Double
     /// 该条记录表达的是"今日已签到、本次未重复领取"（各平台/本地台账的跳过结果）
     var skipped: Bool = false
+}
+
+// MARK: - 签到问题条目（「签到结果与异常」卡的数据源）
+/// 为什么不再返回拼好的 String：旧实现把「账号名 + 报错」合成一行文本交给 UI，
+/// 结果只能是 `lineLimit(1)` 截断显示，报错详情永远看不到；而且从拼好的字符串里
+/// 抠不出账号名，「立即处理」只能盲目跳到账号管理页 —— 那一页甚至没有重试入口。
+/// 改成逐账号的对象后，UI 才能做到「点这一条 → 弹这一条的详情 → 只重试这个账号」。
+struct CheckinIssue: Identifiable, Hashable {
+    /// "fail" 需要用户处理；"restricted" 平台侧不可用（账号与凭证都是好的）
+    var state: String
+    var name: String
+    var hit: LogHit
+
+    var id: String { name }
+    var isRestricted: Bool { state == "restricted" }
+
+    /// 下一步该干什么。只是**建议**，不做任何自动处理 —— 判错最多是建议不对，不会误伤账号。
+    enum Fix {
+        case relogin    // 凭证失效 → 重新登录 / 更新 Cookie
+        case retry      // 疑似偶发 → 直接重试
+        case wait       // 网络 / 超时 → 稍后再试
+        case none       // 平台侧问题 → 重试也没用
+    }
+
+    /// 按报错文案粗分类。关键词取自 checkin.py 与各平台客户端实际会吐出的文案
+    /// （"登录态已失效，请重新扫码登录" / "签到失败：…（HTTP 401）" / "CookieError: …"）。
+    func diagnose() -> (title: String, detail: String, fix: Fix) {
+        if isRestricted {
+            return ("平台侧限制，无需处理",
+                    "该平台的签到活动已下线、接口迁移或触发风控。账号和 Cookie 都是好的，反复重试或重新登录都不会有变化，等平台恢复即可。",
+                    .none)
+        }
+        let low = hit.msg.lowercased()
+        func has(_ keys: [String]) -> Bool { keys.contains { low.contains($0) } }
+
+        // 必须排在通用"登录态失效"之前：WorkBuddy 桌面端把凭据加密后，我们读不到明文，
+        // 这**不是**"凭证失效"，重登桌面端也没用。并进下面那条的话，用户会照
+        // "重新登录即可恢复"去重登桌面端一遍，症状一模一样 —— 白折腾。
+        if has(["读不到明文", "加密存储", "$wbencrypted"]) {
+            return ("本机登录态已读不到",
+                    "WorkBuddy 桌面端把登录凭据改成了加密存储（密钥在它的原生模块里、不落盘），"
+                    + "所以本工具读不到明文 accessToken。能真正签到的凭据来自「扫码登录」："
+                    + "点这个账号的「重新登录」扫一次码即可恢复，不需要动桌面端。",
+                    .relogin)
+        }
+
+        if has(["登录态已失效", "请重新登录", "请重新扫码", "未登录", "请先登录", "logout",
+                "cookie 失效", "cookie失效", "cookie缺失", "凭证失效", "凭据失效",
+                "token 过期", "token已过期", "token 为空", "unauthorized", "forbidden",
+                "401", "403",
+                // WorkBuddy「本机登录态」来源的账号，凭据只有桌面端有：文件不在
+                // （桌面端没登录）时也是这一类 —— 修法就是登录一次并更新凭据。
+                "未找到 workbuddy 登录态"]) {
+            return ("登录凭证已失效",
+                    "报错里出现了登录态失效的信号。重新登录（或更新 Cookie）后再重试即可恢复，签到任务本身没有问题。",
+                    .relogin)
+        }
+        if has(["超时", "timeout", "timed out", "网络", "network", "连接失败", "connection",
+                "拒绝连接", "reset by peer", "dns", "暂时不可用", "502", "503", "504"]) {
+            return ("网络或平台临时不可用",
+                    "看起来是网络不通，或对方服务临时抖动。稍等一会儿再重试通常就能通过，不需要重新登录。",
+                    .wait)
+        }
+        if has(["未配置", "不支持的平台", "未找到账号", "缺少"]) {
+            return ("账号配置缺失",
+                    "这条严格说不是签到失败，而是账号本身没配好（缺 Cookie / 平台类型不认识）。去账号管理页补齐配置再回来重试。",
+                    .relogin)
+        }
+        return ("签到未成功",
+                "没识别出明确的失效或网络原因。可以先重试一次；若反复失败，再去账号管理页更新这个账号的登录凭证。",
+                .retry)
+    }
 }
 
 struct ParsedLogs {
@@ -227,7 +353,7 @@ struct ParsedLogs {
         guard tail.contains("("), tail.contains(")") else { return }
         guard let open = tail.firstIndex(of: "("), let close = tail.firstIndex(of: ")"), open < close else { return }
         let name = String(tail[..<open])
-        let app = String(tail[tail.index(after: open)..<close])
+        // 括号里是 app 字段，日志解析用不上（按账号名索引即可），跳过不取。
         tail = String(tail[tail.index(after: close)...]).trimmingCharacters(in: .whitespaces)
         if tail.hasPrefix("->") { tail = String(tail.dropFirst(2)).trimmingCharacters(in: .whitespaces) }
         if tag == "预览" { return }
@@ -394,6 +520,8 @@ enum AppPaths {
 
     static var accountsFile: String { projectDir + "/accounts.json" }
     static var logFile: String { projectDir + "/logs/checkin.log" }
+    /// 签到台账（含当日各账号的子任务清单），由 checkin.py 写、SubTaskStore 读。
+    static var stateFile: String { projectDir + "/logs/checkin_state.json" }
     static var launchdLog: String { projectDir + "/logs/launchd.log" }
     static var launchdErr: String { projectDir + "/logs/launchd.err.log" }
     static var curDir: String { FileManager.default.currentDirectoryPath }

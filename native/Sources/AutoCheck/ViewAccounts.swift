@@ -175,10 +175,16 @@ struct AccountsView: View {
 
     // MARK: 凭证健康检查
     private var healthCard: some View {
+        // 「凭证已失效」有两种：字段压根没填（credentialHint 报红），和字段填了、平台已经不认。
+        // 原来只算前者，于是一个 Cookie 已过期的账号在这张卡里仍被算成"凭证均正常" ——
+        // 而现在 `needsRelogin` 用的正是"今天的失败文案指向凭据失效"，这才是真凭据。
+        // 一律走 `needsRelogin`，不再在这里给 WorkBuddy 另判一套口径。
+        // 这张卡自己就踩过这个坑：两套口径必然对不上 —— 卡片数出来的坏账号与
+        // 账号行给不给「重新登录」按钮会不一致，于是卡上写着"点下方重新登录"，
+        // 用户回到下面却发现根本没有按钮。WorkBuddy 两种来源的差异已在 needsRelogin 里处理。
         let bad = m.accounts.filter { acc in
-            if acc.isWorkBuddy { return m.wbHealthy == false }
-            if let hint = acc.credentialHint() { return hint.color != .green }
-            return false
+            if acc.isRetired { return false }                   // 平台停用 ≠ 凭证坏了
+            return m.needsRelogin(acc.name)
         }
         return Card(padding: nil) {
             HStack(spacing: 14) {
@@ -196,7 +202,8 @@ struct AccountsView: View {
                         .foregroundColor(Theme.text)
                     Text(bad.isEmpty
                          ? "\(m.accounts.count) 个账号凭证均正常，可正常参与自动签到"
-                         : "\(m.accounts.count) 个账号中 \(bad.count) 个凭证已失效，可能影响自动签到")
+                         : "\(m.accounts.count) 个账号中 \(bad.count) 个登录凭据已失效或过期，会影响自动签到"
+                            + "（点对应账号下方的「重新登录」即可更新）")
                         .font(.system(size: 11.5))
                         .foregroundColor(Theme.textSub)
                 }
@@ -240,7 +247,9 @@ struct AccountsView: View {
         return list
     }
 
-    /// 按平台分组：Trae → WorkBuddy → Bilibili → 联想智选 → 京东 → 其他平台（组内按账号名排序）。
+    /// 按平台分组：Trae → WorkBuddy → Bilibili → 联想智选 → 什么值得买 →
+    /// 阿里云盘 → 中国移动云盘 → 京东 → 其他平台（组内按账号名排序）。
+    /// 京东排在最后：它已停用，只留着让老账号可见、可删，不该占据视觉前排。
     /// 分组键复用 `Account.platformIconName`，保证分组与头像图标同源，不会各写一套判断。
     private func groupedAccounts(_ rows: [Account]) -> [AccountGroup] {
         let buckets = [
@@ -248,7 +257,10 @@ struct AccountsView: View {
             AccountGroup(id: "workbuddy", title: "WorkBuddy", iconName: "workbuddy", accounts: []),
             AccountGroup(id: "bilibili", title: "Bilibili", iconName: "bilibili", accounts: []),
             AccountGroup(id: "lenovo", title: "联想智选", iconName: "lenovo", accounts: []),
-            AccountGroup(id: "jd", title: "京东", iconName: "jd", accounts: []),
+            AccountGroup(id: "smzdm", title: "什么值得买", iconName: "smzdm", accounts: []),
+            AccountGroup(id: "aliyunpan", title: "阿里云盘", iconName: "aliyunpan", accounts: []),
+            AccountGroup(id: "caimcloud", title: "中国移动云盘", iconName: "caimcloud", accounts: []),
+            AccountGroup(id: "jd", title: "京东（平台已停用）", iconName: "jd", accounts: []),
             AccountGroup(id: "other", title: "其他平台", iconName: nil, accounts: []),
         ]
         return buckets.compactMap { bucket in
@@ -299,8 +311,13 @@ struct AccountsView: View {
     }
 
     private func groupSummary(_ g: AccountGroup) -> String {
-        let enabled = g.accounts.filter { $0.isEnabled }
-        if enabled.isEmpty { return "全部已停用" }
+        // 平台已停用的账号不参与进度：它们既不签到也不再产生记录，
+        // 算进来会让整组永远停在「0/1 已完成」。
+        let enabled = g.accounts.filter { $0.isEnabled && !$0.isRetired }
+        if enabled.isEmpty {
+            if g.accounts.contains(where: { $0.isEnabled }) { return "平台已停用，不再自动签到" }
+            return "全部已停用"
+        }
         let done = enabled.filter { m.accStatus($0.name).state == "done" }.count
         let fail = enabled.filter { m.accStatus($0.name).state == "fail" }.count
         let restricted = enabled.filter { m.accStatus($0.name).state == "restricted" }.count
@@ -400,13 +417,29 @@ struct AccountRowView: View {
         }
         .padding(.horizontal, hpad)
         .frame(height: 58)
-        .background(hovering ? Color(hex: 0xF7F7F7) : Color.clear)
+        .background(rowBackground)
+        .overlay(alignment: .leading) {
+            // 从异常弹窗跳过来时补一条竖标：一屏十几行，光靠淡底色还是容易被划过
+            if m.focusAccount == acc.name {
+                Rectangle().fill(Theme.accent).frame(width: 3)
+            }
+        }
         .contentShape(Rectangle())
-        .onTapGesture { if !editing { editing = true; newName = acc.name } }
+        .onTapGesture {
+            m.focusAccount = nil      // 点过这一行，就不必再提示"是哪一行"了
+            if !editing { editing = true; newName = acc.name }
+        }
         .onHover { hovering = $0 }
         .confirmationDialog("确认删除账号「\(acc.name)」？", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("删除", role: .destructive) { m.deleteAccount(acc) }
         }
+    }
+
+    /// 从异常弹窗按「去账号页处理」跳过来时，这一行要能被一眼认出来；
+    /// 平时就是普通 hover 底色。（`focusAccount` 在该行被点击或离开账号页时清掉。）
+    private var rowBackground: Color {
+        if m.focusAccount == acc.name { return Theme.accentSoft }
+        return hovering ? Color(hex: 0xF7F7F7) : Color.clear
     }
 
     private var letter: String {
@@ -441,6 +474,8 @@ struct AccountRowView: View {
             Text("·").font(.system(size: 11.5)).foregroundColor(Theme.textFaint)
             if !acc.isEnabled {
                 Text("已暂停自动签到").font(.system(size: 11.5)).foregroundColor(Theme.textSub)
+            } else if acc.isRetired {
+                Text("该平台签到已下线，不再自动签到").font(.system(size: 11.5)).foregroundColor(Theme.warn)
             } else if (st.state == "fail" || st.state == "restricted"), let hit = st.hit, !hit.msg.isEmpty {
                 // 受限也把原因摆出来（"京东侧限制：…"），避免用户以为是自己的 cookie 坏了
                 Text(hit.msg)
@@ -450,13 +485,63 @@ struct AccountRowView: View {
             } else {
                 Text("连续 \(streak) 天").font(.system(size: 11.5)).foregroundColor(Theme.textSub)
             }
+            // 凭证失效 / 未配置时**就地**给出入口，与左边是哪一句无关：
+            // 报错文案里明明写着"请重新登录"，而这一列原来是死的 ——
+            // 用户照着提示来账号页，却发现无处可点（凭证缺失、还没签到过的账号同理）。
+            if m.needsRelogin(acc.name), m.canRelogin(acc) {
+                reloginChip
+            }
         }
+    }
+
+    /// 「重新登录」——只在**凭据真的需要更新**的账号上出现。
+    /// 它不是状态展示（状态由左侧胶囊负责），而是"照着报错去修"的那一步，
+    /// 所以刻意**不用**失败色的红底胶囊：那看起来像又一个状态标签，
+    /// 而灰色的 SoftTag 语法在本页已经确立了"这是可以点的"。
+    ///
+    /// 文案必须按**本账号**判断（`loginAccount`），不能直接用全局的 `loginRunning`：
+    /// 那个是"有没有登录正在进行"，一次只允许一个。拿它当逐行文案的话，
+    /// 点一个账号会让**所有**账号的按钮同时变成"登录中…"，看着像全被点了。
+    /// 禁用仍然用全局值 —— 并发登录本就不该发生。
+    private var reloginChip: some View {
+        let mine = m.loginAccount == acc.name
+        return Button { m.relogin(acc) } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "person.badge.key").font(.system(size: 10.5))
+                Text(mine ? "登录中…" : "重新登录").font(.system(size: 11.5, weight: .medium))
+            }
+            .foregroundColor(mine ? Theme.textFaint : Theme.textBody)
+            .padding(.horizontal, 8)
+            .frame(height: 20)
+            .background(Theme.chipBG)
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(Theme.border, lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .disabled(m.loginRunning)
+        .fixedSize()
+        .help("打开内置浏览器登录「\(acc.name)」，更新的是这个账号自己的\(reloginNoun)，不会新增账号")
+    }
+
+    /// 按钮 tooltip 里的凭据名词。WorkBuddy / Trae 拿到的是**登录态**，不是 Cookie ——
+    /// 直接套 `credentialNoun`（默认"Cookie"）会写出"更新的是这个账号自己的 Cookie"这种错话。
+    private var reloginNoun: String {
+        if acc.isWorkBuddy { return "登录态" }
+        if acc.isTrae { return "登录令牌" }
+        return acc.credentialNoun
     }
 
     @ViewBuilder
     private var statusView: some View {
         if !acc.isEnabled {
             StatusPill(text: "已停用", color: Theme.neutral, bg: Theme.chipBG)
+        } else if acc.isRetired {
+            // 「平台已停用」≠「账号已停用」：前者是平台侧整条链路下线（京东京豆），
+            // 后者是用户自己关掉了开关。两者都显示"已停用"会让人找不着北。
+            StatusPill(text: "平台已停用", color: Theme.warn, bg: Theme.warnSoft)
         } else {
             switch state {
             case "done": StatusPill(text: "已完成", color: Theme.success, bg: Theme.successSoft)
@@ -468,7 +553,9 @@ struct AccountRowView: View {
     }
 
     private var recentText: String {
-        if !acc.isEnabled { return "—" }
+        // 平台已停用：没有、也不会再有记录，"最近签到"一栏如实留空，
+        // 而不是沿用历史日志假装它还在跑。
+        if !acc.isEnabled || acc.isRetired { return "—" }
         let st = m.accStatus(acc.name)
         if st.state == "pending" {
             guard let last = m.parsed.lastHit(name: acc.name) else { return "尚未签到" }
@@ -544,7 +631,7 @@ struct AddAccountPanel: View {
             }
 
             VStack(alignment: .leading, spacing: 7) {
-                label("账号名称（可不填）")
+                label(cur.label2)
                 FieldBox {
                     TextField(cur.placeholder, text: $name)
                         .textFieldStyle(.plain).font(.system(size: 13)).foregroundColor(Theme.inputText)
@@ -557,21 +644,30 @@ struct AddAccountPanel: View {
                 GreenSwitch(isOn: $autoEnable)
             }
 
-            Button {
-                switch cur.kind {
-                case .workbuddy:
-                    m.runWorkBuddyOAuth(name: name, enabled: autoEnable)
-                case .trae:
-                    m.runTraeLogin(name: name, enabled: autoEnable)
-                case .cookie:
-                    m.runCookieBrowserLogin(type: cur.type, name: name, enabled: autoEnable)
+            // 弹浏览器这条路：只在真的会弹浏览器时才出现按钮 ——
+            // 摆一个点不动的按钮，比没有按钮更糟。
+            if cur.kind != .manual {
+                Button {
+                    switch cur.kind {
+                    case .workbuddy:
+                        m.runWorkBuddyOAuth(name: name, enabled: autoEnable)
+                    case .trae:
+                        m.runTraeLogin(name: name, enabled: autoEnable)
+                    case .cookie:
+                        // mode 必须显式传：这里填了名字也可能是"新增一个叫 X 的账号"，
+                        // 脚本自己分辨不了（见 AppModel.runCookieBrowserLogin 注释）。
+                        m.runCookieBrowserLogin(type: cur.type, name: name,
+                                                enabled: autoEnable, mode: "add")
+                    case .manual:
+                        break
+                    }
+                } label: {
+                    Label(m.loginRunning ? "正在等待登录完成…" : "打开登录浏览器", systemImage: "globe")
+                        .frame(maxWidth: .infinity)
                 }
-            } label: {
-                Label(m.loginRunning ? "正在等待登录完成…" : "打开登录浏览器", systemImage: "globe")
-                    .frame(maxWidth: .infinity)
+                .buttonStyle(PrimaryButtonStyle())
+                .disabled(m.loginRunning)
             }
-            .buttonStyle(PrimaryButtonStyle())
-            .disabled(m.loginRunning)
 
             Text(cur.hint)
                 .font(.system(size: 11.5)).foregroundColor(Theme.textSub)
@@ -579,13 +675,16 @@ struct AddAccountPanel: View {
 
             // 平台专属的次级路径（都不弹浏览器）：
             //   WorkBuddy -> 直接读本机桌面端登录态
-            //   Cookie 型 -> 手动粘贴 Cookie
+            //   Cookie 型 -> 手动粘贴 Cookie（次级，在主按钮下方）
+            //   粘贴型    -> 粘贴凭据就是主路径，不写"或者"
             //   Trae      -> 无（Trae 只有浏览器登录一条路）
             switch cur.kind {
             case .workbuddy:
                 workbuddyLocalSection
             case .cookie:
-                manualCookieSection(cur)
+                manualCookieSection(cur, isPrimary: false)
+            case .manual:
+                manualCookieSection(cur, isPrimary: true)
             case .trae:
                 EmptyView()
             }
@@ -641,14 +740,24 @@ struct AddAccountPanel: View {
         .frame(width: 188)
     }
 
-    /// Cookie 型平台的「或手动粘贴 Cookie」次级路径
+    /// 凭据型平台的粘贴路径。
+    /// 文案跟着平台走：阿里云盘的登录态是 refresh_token、移动云盘是 authorization，
+    /// 都不能叫 Cookie，否则用户会照着标签粘错东西而且不报错。
+    /// - Parameter isPrimary: true 时这是该平台唯一的主路径，标题不写「或」。
     @ViewBuilder
-    private func manualCookieSection(_ cur: BrowserOption) -> some View {
+    private func manualCookieSection(_ cur: BrowserOption, isPrimary: Bool) -> some View {
+        let noun = Self.credentialNoun(cur.type)
         Divider().overlay(Theme.hairline).padding(.vertical, 2)
         VStack(alignment: .leading, spacing: 10) {
-            Text("或手动粘贴 Cookie")
+            Text(isPrimary ? "粘贴\(noun)" : "或手动粘贴\(noun)")
                 .font(.system(size: 12.5, weight: .semibold))
                 .foregroundColor(Theme.text)
+            if let tip = Self.manualCredentialTip(cur.type) {
+                Text(tip)
+                    .font(.system(size: 11.5))
+                    .foregroundColor(Theme.textSub)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             TextEditor(text: $cookie)
                 .font(.system(size: 11.5, design: .monospaced))
                 .foregroundColor(Theme.inputText)
@@ -671,39 +780,109 @@ struct AddAccountPanel: View {
                     Label("手动粘贴保存", systemImage: "checkmark")
                 }
                 .buttonStyle(GhostButtonStyle())
+                // 凭据必须有；名称可以留空——前提是平台能自动命名（移动云盘从
+                // `授权码#手机号` 取后四位）。判据与 addCookieAccount 共用
+                // AppModel.autoName，不在视图里另写一套"能不能留空"的规则。
                 .disabled(m.loginRunning
-                          || name.trimmingCharacters(in: .whitespaces).isEmpty
-                          || cookie.trimmingCharacters(in: .whitespaces).isEmpty)
+                          || cookie.trimmingCharacters(in: .whitespaces).isEmpty
+                          || (name.trimmingCharacters(in: .whitespaces).isEmpty
+                              && AppModel.autoName(type: cur.type,
+                                                   credential: cookie.trimmingCharacters(in: .whitespaces)) == nil))
             }
         }
     }
 
-    /// 「浏览器登录」的平台列表：WorkBuddy 扫码 / Trae / Cookie 型平台
-    private var browserOptions: [BrowserOption] {        var list: [BrowserOption] = [
+    /// 凭据的中文名。转调 AppModel 的同一份实现，避免 UI 与数据层各写一套。
+    static func credentialNoun(_ type: String) -> String {
+        AppModel.credentialNoun(for: type)
+    }
+
+    /// 各平台手动粘贴的取法提示；返回 nil 表示不需要额外说明（顶部 hint 已交代）。
+    static func manualCredentialTip(_ type: String) -> String? {
+        switch type {
+        case "bilibili":
+            // 签到只要 SESSDATA，但「领权益」（每月漫读券 / 大会员福利 / 银瓜子换硬币）
+            // 都是 POST，必须带 bili_jct 当 csrf —— 只贴 SESSDATA 会静默少掉这些收益。
+            return "请粘贴完整 Cookie（至少含 SESSDATA 与 bili_jct 两项）："
+                + "只有 SESSDATA 时能签到，但领权益会被 csrf 校验拦下。"
+                + "用上面的「打开登录浏览器」会自动抓全，一般不必手填。"
+        case "aliyunpan":
+            return "阿里云盘的登录态不在 Cookie 里：打开网页版并登录 → F12 控制台执行 "
+                + "JSON.parse(localStorage.getItem(\"token\")).refresh_token，把输出的长串粘到这里。"
+        case "smzdm":
+            return "推荐用 App 抓包得到的完整 Cookie（含 sess），签走走的是 App 端签名接口；"
+                + "只粘网页版 Cookie 时程序会自动退到网页端接口重试。"
+        case "caimcloud":
+            return "一般不用手填：点上面的「打开登录浏览器」登录 yun.139.com，"
+                + "程序会自己从页面里取 authorization 与手机号。"
+                + "若要手动填：按 authorization#手机号 的格式粘贴"
+                + "（authorization 在 yun.139.com 登录后的 Cookie 里，手机号用于换取签到登录态），"
+                + "例如 abc123...xyz#13900000000；"
+                + "账号名留空时会自动命名为「移动云盘-手机号后四位」。"
+        default:
+            return nil
+        }
+    }
+
+    /// 「浏览器登录」的平台列表：WorkBuddy 扫码 / Trae / 凭据型平台。
+    /// 平台清单来自 `AppModel.addableCookiePlatforms`（已剔除平台侧停用的京东），
+    /// 所以新增/停用平台只改数据表一处，视图自动跟上。
+    private var browserOptions: [BrowserOption] {
+        var list: [BrowserOption] = [
             BrowserOption(type: "workbuddy", label: "WorkBuddy", iconName: "workbuddy",
                           symbol: "qrcode.viewfinder",
+                          label2: "账号名称（可不填）",
                           placeholder: "留空则自动读取账号昵称",
                           hint: "将弹出内置浏览器打开授权页，扫码后自动换取并保存登录态；"
                               + "token 等同密码，仅本机存储。名称留空时自动以昵称命名。",
                           kind: .workbuddy),
             BrowserOption(type: "trae", label: "Trae", iconName: "trae",
                           symbol: "chevron.left.forwardslash.chevron.right",
+                          label2: "账号名称（可不填）",
                           placeholder: "留空则按账号 ID 自动命名",
                           hint: "将弹出内置浏览器窗口，登录后程序自动识别并保存登录态（约 14 天有效）。"
                               + "Trae 登录态不含昵称，名称留空时按账号 ID 命名。",
                           kind: .trae),
         ]
-        for p in AppModel.cookiePlatforms {
-            let extra = p.type == "lenovo"
-                ? "联想智选也可在终端执行 python3 lenovo.py --login-account --name <账号名> 走账密登录。"
-                : ""
+        for p in AppModel.addableCookiePlatforms {
+            var hint = ""
+            let kind = LoginKind.cookie
+            switch p.type {
+            case "caimcloud":
+                // 登录态是「authorization + 手机号」两段，网页版页面状态里两段都有，
+                // 所以浏览器登录是主路径（browser_login.py 用 JS 一次取全），
+                // 手动粘贴只是次级兜底。
+                hint = "将弹出内置浏览器打开移动云盘网页版（yun.139.com），登录后自动读取页面里的 "
+                    + "authorization 与手机号并保存；"
+                    + "授权码等同密码，仅本机存储，列表/日志只显示脱敏摘要；"
+                    + "名称留空时自动命名为「移动云盘-手机号后四位」。"
+            case "aliyunpan":
+                hint = "将弹出内置浏览器打开阿里云盘登录页，登录后程序自动读取本机 localStorage "
+                    + "里的 refresh_token 并保存；"
+                    + "刷新令牌等同密码，仅本机存储，列表/日志只显示脱敏摘要；"
+                    + "名称留空时自动以昵称命名。"
+            case "smzdm":
+                hint = "将弹出内置浏览器打开什么值得买登录页，登录后自动抓取网页版 Cookie 并保存；"
+                    + "若你的签到走 App 端 Cookie，请改用下面的「手动粘贴」；"
+                    + "Cookie 等同密码，仅本机存储，列表/日志只显示脱敏摘要。"
+            default:
+                hint = "将弹出内置浏览器，扫码或账密登录后自动抓取 Cookie 并保存；"
+                    + "Cookie 等同密码，仅本机存储，列表/日志只显示脱敏摘要；"
+                    + "名称留空时自动以昵称命名。"
+            }
+            if p.type == "lenovo" {
+                hint += "联想智选也可在终端执行 python3 lenovo.py --login-account --name <账号名> 走账密登录。"
+            }
+            // 对所有 Cookie 型平台都成立，且是用户最容易踩的坑：
+            // 新增走的是全新浏览器会话，所以"上次登过一次"不会妨碍这次登录另一个账号。
+            hint += "每次打开都是全新会话，可登录与已有账号不同的另一个账号；"
+                + "若这次登的仍是已有账号，会明确提示、不会静默覆盖。"
             list.append(BrowserOption(type: p.type, label: p.label, iconName: p.type,
                                       symbol: cookieSymbol(p.type),
+                                      label2: "账号名称（可不填）",
                                       placeholder: "留空则自动读取账号昵称",
-                                      hint: "将弹出内置浏览器，扫码或账密登录后自动抓取 Cookie 并保存；"
-                                          + "Cookie 等同密码，仅本机存储，列表/日志只显示脱敏摘要；"
-                                          + "名称留空时自动以昵称命名。" + extra,
-                                      kind: .cookie))
+                                      hint: hint,
+                                      kind: kind))
         }
         return list
     }
@@ -713,6 +892,9 @@ struct AddAccountPanel: View {
         case "bilibili": return "play.rectangle"
         case "lenovo": return "laptopcomputer"
         case "jd": return "cart"
+        case "smzdm": return "tag"
+        case "aliyunpan": return "externaldrive.connected.to.line.below"
+        case "caimcloud": return "cloud"
         default: return "globe"
         }
     }
@@ -722,7 +904,7 @@ struct AddAccountPanel: View {
         VStack(alignment: .leading, spacing: 12) {
             Divider().overlay(Theme.hairline).padding(.vertical, 2)
 
-            Text("或读取本机桌面端登录态")
+            Text(m.wbEncrypted ? "本机桌面端登录态（已加密，读不到）" : "或读取本机桌面端登录态")
                 .font(.system(size: 12.5, weight: .semibold))
                 .foregroundColor(Theme.text)
 
@@ -742,35 +924,55 @@ struct AddAccountPanel: View {
                 Button { m.probeWorkBuddy() } label: { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(GhostButtonStyle())
                     .disabled(m.loginRunning)
-                Button {
-                    m.addWorkBuddyAccount(name: name, enabled: autoEnable)
-                } label: {
-                    Label(m.loginRunning ? "正在读取…" : "读取本机登录态并添加",
-                          systemImage: "person.crop.circle.badge.plus")
+                // 加密这条路上「读取并添加」永远不可能成功（重登桌面端也还是加密的），
+                // 所以干脆不摆这个按钮：摆一个永远灰着的按钮，等于骗用户反复去点。
+                if !m.wbEncrypted {
+                    Button {
+                        m.addWorkBuddyAccount(name: name, enabled: autoEnable)
+                    } label: {
+                        Label(m.loginRunning ? "正在读取…" : "读取本机登录态并添加",
+                              systemImage: "person.crop.circle.badge.plus")
+                    }
+                    .buttonStyle(GhostButtonStyle())
+                    .disabled(m.loginRunning || m.wbHealthy != true)
                 }
-                .buttonStyle(GhostButtonStyle())
-                .disabled(m.loginRunning || m.wbHealthy != true)
             }
 
-            Text("读取桌面端当前已登录的账号（不弹浏览器）；名称留空时自动用本机昵称命名。"
-                 + "凭据安全：accessToken/refreshToken 等同账号密码，仅写入 accounts.json（.gitignore 排除），"
-                 + "不写日志、不在界面回显明文。")
-                .font(.system(size: 11.5)).foregroundColor(Theme.textSub)
-                .fixedSize(horizontal: false, vertical: true)
+            if m.wbEncrypted {
+                Text("这条路暂时走不通：桌面端新版把凭据写成了加密信封，密钥在它的原生模块里、不落盘，"
+                     + "所以任何第三方程序都读不到明文。改用上面的「扫码登录」——"
+                     + "它不依赖桌面端，拿到的是本工具自己的登录态，签到效果一样。")
+                    .font(.system(size: 11.5)).foregroundColor(Theme.textSub)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("读取桌面端当前已登录的账号（不弹浏览器）；名称留空时自动用本机昵称命名。"
+                     + "凭据安全：accessToken/refreshToken 等同账号密码，仅写入 accounts.json（.gitignore 排除），"
+                     + "不写日志、不在界面回显明文。")
+                    .font(.system(size: 11.5)).foregroundColor(Theme.textSub)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
     private var wbColor: Color {
         switch m.wbHealthy {
         case .some(true): return Theme.success
-        case .some(false): return Theme.accent
+        // 加密不是"出错"：账号本身是好的，只是我们读不到 → 用橙（受限）而不是红（失败），
+        // 免得用户以为自己的 WorkBuddy 登录坏了。
+        case .some(false): return m.wbEncrypted ? Theme.warn : Theme.accent
         default: return Theme.warn
         }
     }
     private var wbText: String {
         switch m.wbHealthy {
         case .some(true): return "已检测到本机 WorkBuddy 登录态" + (m.wbNickname.isEmpty ? "" : "（\(m.wbNickname)）")
-        case .some(false): return "未检测到 WorkBuddy 登录态，请先打开桌面端登录后重新检测。"
+        case .some(false):
+            // 「有登录态但被加密」和「压根没登录」必须分开说 —— 给同一句话就等于
+            // 让用户去重登桌面端白折腾一遍（重登完还是加密的，症状一模一样）。
+            if m.wbEncrypted {
+                return m.wbReason.isEmpty ? "本机登录态已被桌面端加密，读不到明文凭据。" : m.wbReason
+            }
+            return "未检测到 WorkBuddy 登录态，请先打开桌面端登录后重新检测。"
         default: return "正在检测本机 WorkBuddy 登录态…"
         }
     }
@@ -781,8 +983,12 @@ struct AddAccountPanel: View {
 /// （弹出内置浏览器 → 登录 → 抓登录态），所以共用一套 UI、用平台下拉切换。
 ///   - workbuddy -> workbuddy_login.py（OAuth device flow 扫码）
 ///   - trae      -> trae_login.py（抓 localStorage token + 长效会话 Cookie）
-///   - cookie    -> browser_login.py（抓平台 Cookie）
-private enum LoginKind { case workbuddy, trae, cookie }
+///   - cookie    -> browser_login.py（抓平台 Cookie；阿里云盘 / 中国移动云盘
+///                  的登录态不在 Cookie 里，走「在页面里执行 JS 取值」那条路）
+///   - manual    -> 没有可用的浏览器抓取路径，主路径就是"粘贴凭据"。
+///                  当前没有平台使用（移动云盘已确认能从网页版页面状态里自动
+///                  取到 authorization 与手机号），保留给将来真抓不到的平台。
+private enum LoginKind { case workbuddy, trae, cookie, manual }
 
 /// 「浏览器登录」的平台选项
 private struct BrowserOption {
@@ -790,6 +996,10 @@ private struct BrowserOption {
     let label: String
     let iconName: String?
     let symbol: String
+    /// 名称输入框的标签。目前**所有平台都能留空**（浏览器登录脚本的 `--name` 可选、
+    /// 移动云盘能从凭据里取手机号后四位），所以文案一致；留成字段是为了将来真出现
+    /// 「必须填名」的平台时只改一处。
+    let label2: String
     let placeholder: String
     let hint: String
     let kind: LoginKind

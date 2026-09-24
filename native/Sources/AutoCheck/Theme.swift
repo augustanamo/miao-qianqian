@@ -46,6 +46,23 @@ enum Theme {
     static let sidebarWidth: CGFloat = 240
     static let pagePadding: CGFloat = 38
 
+    // 任务表「今日任务」列的子任务图标。图标偏大（18pt）是因为它在里面还要塞一个
+    // SF Symbol —— 再小就只剩一个色块，等于白占一列。
+    static let taskIconSize: CGFloat = 18
+    static let taskIconGap: CGFloat = 4
+
+    /// 子任务图标的配色：淡底 + 同色字形，与状态胶囊 / 头像共用同一套语义色，
+    /// 免得同一个"失败"在页面里出现两种红。
+    /// `na`（不适用）走中性灰，但它在数据层就被过滤掉了，不会真的画出来。
+    static func taskColors(_ state: SubTaskState) -> (fg: Color, bg: Color) {
+        switch state {
+        case .done:      return (success, successSoft)
+        case .running:   return (warn, warnSoft)
+        case .fail:      return (accent, accentSoft)
+        case .idle, .na: return (textFaint, chipBG)
+        }
+    }
+
     static let version = "v2.4.1"
 }
 

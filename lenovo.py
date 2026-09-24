@@ -5,10 +5,13 @@
 接口思路参考开源项目协议（lenovo-sign / mclub 签到），代码为本项目内
 独立实现，不照搬任何仓库源码：
   - GET https://mclub.lenovo.com.cn/signlist/
-       签到页（需登录 cookie），页面内嵌 var $CONFIG = {...}，
-       含 signState（今日是否已签）、rowKey（签到提交凭据）、memberSource
+       签到页（需登录 cookie），页面内嵌 `$CONFIG`（逐行 `$CONFIG.key = 值`），
+       含 token（Laravel CSRF 令牌）、signPath（提交路径，实测 "/signadd"）、
+       signState（"1" = 今日已签，未签时为空串）、lenovoId、userAgent
   - POST https://mclub.lenovo.com.cn/signadd
-       执行签到（当天已签时不调用，幂等）
+       执行签到（当天已签时不调用，幂等）。**必须与上一步共用同一个 cookie jar**：
+       页面响应下发 wap_session，CSRF 校验要求「页面 _token」与「同会话 session
+       cookie」配对。且该接口有服务端抖动（约 20% 通过率），见 checkin()。
   - POST https://reg.lenovo.com.cn/auth/v2/doLogin
        账密自动登录（password 做 Base64），用于"账密登录抓 cookie"模式
 
@@ -29,6 +32,7 @@ CLI：
 """
 
 import base64
+import http.cookiejar
 import json
 import re
 import sys
@@ -43,6 +47,10 @@ SIGNLIST = MCLUB + "/signlist/"
 SIGNADD = MCLUB + "/signadd"
 LOGIN = "https://reg.lenovo.com.cn/auth/v2/doLogin"
 TIMEOUT = 30
+
+# /signadd 的 CSRF 抖动重试上限。实测单次通过率约 20%（真实浏览器同样如此，
+# 见 checkin() 的说明），20 次可把失败概率压到 ~1%。已签到时不会走这条循环。
+SIGN_ATTEMPTS = 20
 
 # 联想 App（mclub 手机站）UA，降低被风控识别的概率
 UA = ("Mozilla/5.0 (Linux; Android 12; Lenovo L78051 Build/SKQ1.220119.001; wv) "
@@ -92,6 +100,74 @@ def _get(url: str, cookie: str = "") -> tuple:
         return e.code, e.read().decode("utf-8", errors="replace")
     except Exception as e:  # noqa: BLE001
         return -1, ""
+
+
+# ---------- 带 cookie jar 的会话 ----------
+# 为什么必须有：mclub 是 Laravel 应用，签到页响应会**下发 wap_session**，
+# 而 /signadd 的 CSRF 校验要求「页面里的 _token」与「同一会话的 session cookie」
+# 配对。旧实现每次请求都是一条全新连接、把 Set-Cookie 直接丢掉，于是提交签到
+# 恒定 `419 CSRF token mismatch.`（实测 2026-09）。
+# 会话必须贯穿「拉签到页 → 提交签到」两步，所以这里显式持有 opener。
+def _new_session(cookie: str) -> tuple:
+    """用已有 cookie 播种一个会话。返回 (opener, cookie_jar)。"""
+    jar = http.cookiejar.CookieJar()
+    for part in (cookie or "").split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, _, v = part.partition("=")
+        jar.set_cookie(http.cookiejar.Cookie(
+            0, k.strip(), v.strip(), None, False,
+            "mclub.lenovo.com.cn", False, False, "/", True, False, None, False, None, None, {}))
+    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar)), jar
+
+
+def _sess_get(op, url: str) -> tuple:
+    """会话内 GET（Set-Cookie 由 jar 自动接管）。"""
+    headers = {"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9", "Referer": MCLUB}
+    try:
+        with op.open(urllib.request.Request(url, headers=headers, method="GET"),
+                     timeout=TIMEOUT) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return -1, ""
+
+
+def _sess_post(op, url: str, data: dict) -> tuple:
+    """会话内表单 POST。头部按签到页 JS 的真实写法补齐（含 X-Requested-With）。"""
+    body = urllib.parse.urlencode(data).encode("utf-8")
+    headers = {
+        "User-Agent": UA,
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Referer": SIGNLIST,
+    }
+    try:
+        with op.open(urllib.request.Request(url, data=body, headers=headers, method="POST"),
+                     timeout=TIMEOUT) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", errors="replace")
+    except Exception as e:  # noqa: BLE001
+        return -1, json.dumps({"message": f"网络错误：{type(e).__name__}"})
+
+
+def _readable(text: str, limit: int = 120) -> str:
+    """把 HTML 错误页压成一行可读文案。
+
+    旧实现直接把整页 `<!DOCTYPE html>…` 塞进消息里，界面上就是一大坨标签。
+    """
+    t = (text or "").strip()
+    if t[:1] == "<":
+        t = re.sub(r"<script.*?</script>", " ", t, flags=re.S | re.I)
+        t = re.sub(r"<style.*?</style>", " ", t, flags=re.S | re.I)
+        t = re.sub(r"<[^>]+>", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+    return t[:limit] or "(空响应)"
 
 
 # 签到页真实写法（2026-09 实测）：先 `$CONFIG = {};` 再逐行 `$CONFIG.xxx = 值;`
@@ -206,11 +282,21 @@ class LenovoClient:
         self.cookie = (cookie or "").strip()
         if not self.cookie:
             raise CookieError("缺少联想智选 cookie（mclub.lenovo.com.cn）")
+        # 会话持有者：拉签到页时建立，提交签到时复用（CSRF 要求同会话）
+        self._op = None
 
     # ---- 签到页与 $CONFIG ----
     def sign_page(self) -> tuple:
-        """拉取签到页 HTML 并解析 $CONFIG。返回 (ok, config, message)。"""
-        http, html = _get(SIGNLIST, self.cookie)
+        """拉取签到页 HTML 并解析 $CONFIG。返回 (ok, config, message)。
+
+        ⚠️ 必须走**同一个 cookie jar 会话**：签到页响应会下发 `wap_session`，
+        而 /signadd 的 CSRF 校验要求「页面里的 _token」与「该会话的 session
+        cookie」配对。旧实现每次都是新连接、丢掉 Set-Cookie，于是提交签到
+        恒定 `419 CSRF token mismatch.`（实测 2026-09）。
+        会话缓存在 self._op，供 _post_sign() 复用。
+        """
+        self._op, _ = _new_session(self.cookie)
+        http, html = _sess_get(self._op, SIGNLIST)
         if http == -1:
             return False, {}, "网络请求失败"
         if http in (401, 403):
@@ -237,29 +323,47 @@ class LenovoClient:
                 return True
         return False
 
-    def _submit(self, cfg: dict) -> tuple:
-        """构造 signadd 提交参数：优先用页面提供的 rowKey/memberSource/token。"""
-        data = {}
-        for key in ("rowKey", "memberSource", "token", "memberId"):
-            v = cfg.get(key)
-            if v and str(v).strip() not in ("None", "undefined", "null"):
-                data[key] = str(v).strip()
-        if "memberSource" not in data:
-            data["memberSource"] = "LenovoClubAndroid"
-        if not data.get("rowKey") and not data.get("token"):
-            return -1, "页面缺少签到凭据（rowKey/token），请重新获取 cookie"
-        return _post_form(SIGNADD, data, self.cookie)
+    def _post_sign(self, cfg: dict) -> tuple:
+        """单次提交签到（POST 到页面给的 signPath）。返回 (http, text)。
 
-    def checkin(self) -> dict:
-        """每日签到（幂等）。返回 {ok, already, credits, message, http, code}"""
-        ok, cfg, msg = self.sign_page()
-        if not ok:
-            return {"ok": False, "already": False, "credits": 0,
-                    "message": msg, "http": 0, "code": -1}
-        if self.signed_today(cfg):
-            return {"ok": True, "already": True, "credits": 0,
-                    "message": "今日已签到（幂等）", "http": 200, "code": 0}
-        http, text = self._submit(cfg)
+        参数名必须是 Laravel 的 CSRF 字段 **`_token`**，值取页面 `$CONFIG.token`。
+        旧实现发的是 `token` / `rowKey`：
+          · `$CONFIG` 里**根本没有 rowKey**（只有 token / signPath / lenovoId /
+            userAgent / signState / loginName …）；
+          · Laravel 只认 `_token`（或 X-XSRF-TOKEN 头），发 `token` 等于没带
+            CSRF token → 恒定 419。
+        其余参数与前端 signin.js 的 `$.post($CONFIG.signPath, {...})` 逐一对齐：
+        `memberSource` = 页面 `userAgent`（实测 "0"）、`pss`/`deviceId`/`deviceToken`
+        在纯 H5 环境就是空串（页面里 `pss` 只在原生 App 的 `HomeIntent.getP()`
+        存在时才有值），`lenovoId` = 页面 `lenovoId`。
+        """
+        token = str(cfg.get("token") or "").strip()
+        if not token:
+            return -1, "签到页未返回 _token（可能登录态已失效），请重新登录联想"
+        data = {
+            "_token": token,
+            "memberSource": str(cfg.get("userAgent") or "0"),
+            "pss": "",
+            "deviceId": "",
+            "deviceToken": "",
+            "lenovoId": str(cfg.get("lenovoId") or cfg.get("memberId") or ""),
+        }
+        if self._op is None:                 # 直接调 _post_sign 的兜底
+            self.sign_page()
+        return _sess_post(self._op, MCLUB + str(cfg.get("signPath") or "/signadd"), data)
+
+    def _interpret(self, text: str, cfg: dict, http: int) -> dict:
+        """把 /signadd 的响应翻译成统一结果 {ok, already, credits, message, http, code}。
+
+        实测的两种响应形态（2026-09）：
+          首次签到成功：
+            {"success":true,"continueCount":1,"ledouValue":20,"scoreValue":10,
+             "rewardTips":"获得20乐豆\n10积分\n2成长值", ...}   ← **没有 code 字段**
+          重复签到：
+            {"code":0,"msg":"用户已签到","postinfo":{...}}
+        前端判成功用的是 `data.success`（见 signin.js 的 `if (data.code == 200)` 与
+        `shownote(1, data)`），所以**不能只认 code**——只认 code 会把成功判成失败。
+        """
         r = {"ok": False, "already": False, "credits": 0, "message": "",
              "http": http, "code": -1}
         if http == -1:
@@ -268,6 +372,7 @@ class LenovoClient:
         if http in (401, 403):
             r["message"] = f"Cookie 被拒绝（HTTP {http}），请重新获取联想 cookie"
             return r
+
         body = None
         try:
             parsed = json.loads(text or "{}")
@@ -276,42 +381,154 @@ class LenovoClient:
                 r["code"] = parsed.get("code", -1)
         except json.JSONDecodeError:
             body = None
+
+        if body is not None:
+            ledou = self._to_int(body.get("ledouValue"))
+            score = self._to_int(body.get("scoreValue"))
+            if body.get("success") is True:
+                r.update(ok=True, credits=ledou,
+                         message=self._reward_msg(ledou, score))
+                return r
+            code = body.get("code")
+            msg = str(body.get("msg") or body.get("message") or "").strip()
+            if code is not None and str(code) in ("0", "200"):
+                if "已签" in msg or "重复" in msg:
+                    r.update(ok=True, already=True, code=0,
+                             message="今日已签到（幂等）")
+                    return r
+                r.update(ok=True, code=0, credits=self._to_int(body.get("ledouValue")),
+                         message=msg or self._reward_msg(ledou, score))
+                return r
+            # 不要在这里再写一次"签到失败："前缀——run_cookie_acc 统一加，
+            # 否则日志会出现"签到失败：签到失败：xxx"的双重前缀。
+            r["message"] = msg or _readable(text, 120)
+            return r
+
         low = (text or "").lower()
         if "已签到" in low or "签到成功" in low:
-            # 无论结构如何，页面已明确表达签到结果
             return {"ok": True, "already": "已签到" in low,
                     "credits": self._extract_credit(text, cfg),
                     "message": "已签到" if "已签到" in low else "签到成功",
                     "http": http, "code": 0}
-        msg = body.get("message") or body.get("msg") or text[:80] if body else (text or "")[:80]
-        if isinstance(body, dict) and str(body.get("code")) in ("0", "200"):
-            return {"ok": True, "already": False,
-                    "credits": self._extract_credit(text, cfg),
-                    "message": "签到成功", "http": http, "code": 0}
-        # 不要在这里再写一次"签到失败："前缀——run_cookie_acc 统一加，
-        # 否则日志会出现"签到失败：签到失败：xxx"的双重前缀。
-        r["message"] = msg or "未知响应"
+        r["message"] = _readable(text, 120) or "未知响应"
         return r
 
+    def checkin(self) -> dict:
+        """每日签到（幂等）。返回 {ok, already, credits, message, http, code}
+
+        ⚠️ 联想的 `/signadd` 有**服务端抖动**：同一个 _token、同一份 cookie、同一套
+        请求头，只有约 **20%** 的请求能通过 Laravel 的 CSRF 校验，其余恒回
+        `419 {"message":"CSRF token mismatch."}`（HTTP 200 之外的状态码）。
+        这不是我们参数发错：2026-09 用真实 Chromium 调页面自带的 `signSubmit()`
+        复现了同样的比例（4 次里 3 次 419），而且浏览器把数美 `deviceId` /
+        `deviceToken` 都带上了照样失败。真实浏览器里**人手点签到也会时好时坏**。
+        根因基本可以确定是对方后端（openresty + 多实例、会话不粘）：
+
+        所以这里**重试到成功为止**。签到接口是幂等的（重复提交回
+        `{"code":0,"msg":"用户已签到"}`），反复打没有副作用；已签到的情况下
+        `signState == "1"`，在循环之前就短路返回了，一次 POST 都不会发。
+        """
+        ok, cfg, msg = self.sign_page()
+        if not ok:
+            return {"ok": False, "already": False, "credits": 0,
+                    "message": msg, "http": 0, "code": -1}
+        if self.signed_today(cfg):
+            return {"ok": True, "already": True, "credits": 0,
+                    "message": "今日已签到（幂等）", "http": 200, "code": 0}
+
+        for i in range(SIGN_ATTEMPTS):
+            if i:                            # 重试前重取签到页：换一个 _token 与后端实例
+                ok2, cfg2, _ = self.sign_page()
+                if ok2:
+                    cfg = cfg2
+            http, text = self._post_sign(cfg)
+            if http == 419:                  # CSRF 抖动，换一次再打，不算失败
+                continue
+            return self._interpret(text, cfg, http)
+
+        return {"ok": False, "already": False, "credits": 0, "http": 419, "code": -1,
+                "message": f"联想服务端 CSRF 校验持续失败（已重试 {SIGN_ATTEMPTS} 次）；"
+                           f"这是对方接口抖动，不是账号问题，稍后重试即可"}
+
+    @staticmethod
+    def _reward_msg(ledou: int, score: int) -> str:
+        """签到成功文案。数字必须写出来——checkin.py / Swift 侧靠「本次获得 N」取数。"""
+        parts = []
+        if ledou:
+            parts.append(f"{ledou} 乐豆")
+        if score:
+            parts.append(f"{score} 积分")
+        if not parts:
+            return "签到成功"
+        return "签到成功，本次获得 " + "、".join(parts)
+
+    def _user_info(self, attempts: int = 15) -> dict:
+        """GET /signuserinfo —— 乐豆 / 积分 / 延保券余额。
+
+        页面里的 `getUserInfo()` 就是打这个接口（`$('.ledou').html(res.ledou)`）。
+        取到数据时的实测响应：`{"serviceAmount":77,"userCoins":1045,"ledou":"1.6万"}`
+
+        ⚠️ 两点坑：
+        1. `ledou` 是**站点自己四舍五入过的展示串**（"1.6万"），不是精确值；
+           页面只暴露这一个口径，精确到个位的数拿不到。
+        2. 这个接口同样吃 `/signadd` 那套后端抖动：未命中会话节点的请求回
+           `{"res":"Must login"}`，而且 **HTTP 状态码仍是 200** —— 只看状态码会
+           把「没拿到」误判成「拿到了」，所以必须按「有没有期望字段」判定并重试。
+
+        只读接口、best-effort：失败返回空 dict，绝不影响签到状态的判定。
+        """
+        if self._op is None:                     # 直接调用的兜底
+            self.sign_page()
+        # 刻意**不**重建会话、只在同一个 self._op 上反复打：实测同一会话反复 GET 的
+        # 命中率约 35%，而每次重建会话只有 ~10%。15 次足够把失败概率压到 ~0.1%。
+        for _ in range(attempts):
+            http, text = _sess_get(self._op, MCLUB + "/signuserinfo")
+            if http != 200:
+                continue
+            try:
+                obj = json.loads(text or "")
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and any(
+                    k in obj for k in ("ledou", "userCoins", "serviceAmount")):
+                return obj
+        return {}
+
     def status(self) -> dict:
-        """查询今日签到状态（无副作用）。返回 {ok, signed_today, nickname, credits, ...}"""
+        """查询今日签到状态（无副作用）。返回 {ok, signed_today, nickname, credits, ...}
+
+        `credits` 统一口径 = **账号当前可用余额（乐豆）**，取自 `/signuserinfo.ledou`。
+        该字段是站点展示串（"1.6万"），展平后精度只到千位左右，所以同时给出
+        `credits_text`（站点原文）与 `coins`/`warranty_days`，summary 里写原文，
+        界面上不要把数字当成逐位精确值。
+        """
         ok, cfg, msg = self.sign_page()
         base = {"ok": False, "signed_today": None, "nickname": "", "uid": "",
-                "credits": 0, "summary": "", "http": 0, "code": -1, "message": msg}
+                "credits": 0, "credits_text": "", "coins": 0, "warranty_days": 0,
+                "summary": "", "http": 0, "code": -1, "message": msg}
         if not ok:
             return base
+        info = self._user_info()
+        ledou_text = str(info.get("ledou") or "").strip()
         base.update(
             ok=True, http=200, code=0, message="",
             signed_today=self.signed_today(cfg),
             nickname=_cfg_nickname(cfg),
             uid=str(cfg.get("memberId") or cfg.get("lenovoId") or ""),
-            credits=self._to_int(cfg.get("point")),
+            credits=self._num_from_text(info.get("ledou")),
+            credits_text=ledou_text,
+            coins=self._to_int(info.get("userCoins")),
+            warranty_days=self._to_int(info.get("serviceAmount")),
         )
         parts = []
         if base["nickname"]:
             parts.append(f"昵称 {base['nickname']}")
-        if base["credits"]:
-            parts.append(f"乐豆/积分 {base['credits']}")
+        if ledou_text:
+            parts.append(f"乐豆 {ledou_text}")
+        if base["coins"]:
+            parts.append(f"积分 {base['coins']}")
+        if base["warranty_days"]:
+            parts.append(f"延保券 {base['warranty_days']} 天")
         base["summary"] = "，".join(parts)
         return base
 
@@ -332,6 +549,39 @@ class LenovoClient:
         if m:
             return int(m.group(1))
         return LenovoClient._to_int(cfg.get("point"))
+
+    @staticmethod
+    def _num_from_text(v) -> int:
+        """把站点给的展示值展平成整数。
+
+        联想 `/signuserinfo` 的 `ledou` 是 "1.6万" 这种中文缩写串（数字型则原样返回）。
+        展开只是为了让 balance 可比较/可跨平台计数，**精度上限就是站点给的那位**
+        （"1.6万" → 16000，真实值可能在 15500~16499 之间），所以 summary 里
+        仍然写站点原文。
+        """
+        if isinstance(v, bool):
+            return 0
+        if isinstance(v, (int, float)):
+            return int(v)
+        s = str(v or "").strip()
+        if not s:
+            return 0
+        # 用 search 而不是 match："约 2.5 万" / "1.6万+" 这类带前后缀的串也能正确展开
+        m = re.search(r"([\d.]+)\s*(万|亿|[kKwW])?", s)
+        if not m or not m.group(1):
+            return 0
+        try:
+            n = float(m.group(1))
+        except ValueError:
+            return 0
+        unit = m.group(2)
+        if unit == "万" or unit in ("w", "W"):
+            n *= 10000
+        elif unit == "亿":
+            n *= 100000000
+        elif unit in ("k", "K"):
+            n *= 1000
+        return int(round(n))
 
     @staticmethod
     def _to_int(v) -> int:

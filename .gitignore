@@ -20,8 +20,14 @@ logs/
 __pycache__/
 *.pyc
 *.pyo
+# 应用偏好（签到时间、自动重试、刷新频率…）：本机个性化设置，App 运行时生成
+native_prefs.json
+# WorkBuddy IDE 生成的预览产物（PNG/HTML 临时图）
+.workbuddy/preview/
 
 # ---- 构建产物 ----
+# 内置浏览器运行时（playwright + 依赖，约 140MB）：由 setup_browser.sh 重建，不进版本库
+.venv/
 # SwiftPM 构建中间产物（.build 下含大量 .o）
 native/.build/
 DerivedData/
