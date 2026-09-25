@@ -191,6 +191,27 @@
 - 纪律：**idle 的原因只进 tooltip，不进日志**（`_exec` 第 4 项 `note`）。
   `note` 以 `running_prefix` 开头时判 `running` —— 进行态既能保住橙色图标、又不必写日志。
 
+## Trae（`https://www.trae.cn` / `https://work.trae.cn`）
+
+**两套凭证，别搞混**（2026-09-25 实测订正）：
+
+| 字段 | 是什么 | 有效期 | 谁在用 |
+|---|---|---|---|
+| `trae_auth.session` | HttpOnly Cookie `X-Cloudide-Session` | 约 14 天（**观测值**） | **真正的长效凭证**：签到时调 `GetUserToken` 换 JWT |
+| `trae_auth.token` | localStorage `Cloud-IDE-Token`（JWT，`exp = iat + 28800`） | 8 小时 | 只是上次换到的票根，撞 401/403/业务码 1001 就丢弃重换 |
+
+- 签到链路：`TraeClient._post_authed` 先用手头 JWT，被判鉴权失败 → `get_token()` 用 session
+  换一个全新 JWT → 重试一次。**所以存下来的 token 过不过期完全不影响签到**；
+  `checkin.py` 的失败判据也是"缺少 `trae_auth.session`"，不是 token。
+- 实测证据：token 的 exp 已过 10 天（132trae）/ 已过 15 小时（136），当天 09:00 签到
+  照样 `HTTP 200` 成功；换 token 那次重试是静默发生的。
+- ⚠️ UI 曾拿 JWT 的 `exp` 判"凭证已过期" → 天天误报红、挂「重新登录」，用户点了发现根本不用重登。
+  判据已改成**只看 session 在不在**（`Models.credentialHint()`），注释写在那里，别再加回来。
+- "session 约 14 天"是观测值，**不要拿它做倒计时**（那跟上面是同一类错误）；
+  UI 只显示"长效会话 · 已保存 N 天"作参考。
+- 登录侧：`trae_login.py` 抓 localStorage token + 长效 Cookie；没抓到 token 时会用 session 现换一个，
+  所以 token 为空也不算账号坏了。
+
 ## 新增一个凭据型平台：固定改动面（6 步）
 
 原来放在 `MEMORY.md`，为控制那边体积搬到这里——**加平台前照单走一遍**：

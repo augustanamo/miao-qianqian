@@ -256,7 +256,9 @@ final class AppModel: ObservableObject {
     ///    判据复用 `CheckinIssue.diagnose()`，不在这里另写一套关键词表；
     ///    之前"异常弹窗让人去重新登录、账号页却没有任何入口"就是因为两侧各判各的
     ///    （弹窗按文案分类，账号页只看"Cookie 字段非空"）。
-    /// ② 凭据压根没用上（字段没填 / Trae 的 token 过期）—— 不必等签到失败就该给入口。
+    /// ② 凭据压根没用上（字段没填）—— 不必等签到失败就该给入口。
+    ///    只有"凭据字段缺失"这种**静态事实**算数；任何"按时间推算快过期了"都不算
+    ///    （Trae 就栽过：拿 8 小时有效期的 JWT 判过期，而签到时会用长效会话现换一个新的）。
     ///
     /// 平台已停用的（京东）恒为 false：整条链路都下线了，重新登录也不会让签到恢复。
     func needsRelogin(_ name: String) -> Bool {
@@ -274,7 +276,9 @@ final class AppModel: ObservableObject {
            CheckinIssue(state: st.state, name: name, hit: hit).diagnose().fix == .relogin {
             return true
         }
-        if let hint = acc.credentialHint() { return hint.color != .green }
+        // 只有"凭据缺失"（red）才够格给入口。写成 `!= .green` 的话，将来任何
+        // 中性提示色都会被当成"该重新登录"，又是一轮误报。
+        if let hint = acc.credentialHint() { return hint.color == .red }
         return false
     }
 

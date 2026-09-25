@@ -147,8 +147,12 @@ struct Account: Codable, Identifiable, Hashable {
         return nil
     }
 
+    /// 长效会话（X-Cloudide-Session）的脱敏摘要。
+    ///
+    /// 这里**没有**对应的 `maskToken()`：Trae 的 JWT 只有 8 小时，签到时会用长效会话
+    /// 现换一个新的，把它展示出来只会让人误以为"token 过期 = 账号坏了"（这个误判
+    /// 真的发生过）。要看 Trae 的登录态就看 `credentialSummary()` 里的长效会话。
     func maskSession() -> String { Self.mask(trae_auth?.session) }
-    func maskToken() -> String { Self.mask(trae_auth?.token) }
 
     static func mask(_ v: String?) -> String {
         guard let v = v, !v.isEmpty else { return "(空)" }
@@ -156,7 +160,17 @@ struct Account: Codable, Identifiable, Hashable {
         return String(v.prefix(8)) + "******"
     }
 
-    /// 凭证健康：token/session 缺失、无法解析或已过期，一律视为需要重新登录
+    /// 凭证健康：**只回答"这账号现在能不能签"**，不预测未来会不会失效。
+    ///
+    /// ⚠️ 这里踩过一次实打实的误报，改回去之前先读这段：
+    ///   旧实现拿 Trae 的 JWT（`trae_auth.token`）里的 `exp` 跟当前时间比，
+    ///   过期就报红"凭证已过期，请重新登录"。但 Trae 的 JWT 只有 **8 小时**，
+    ///   而签到时 `trae_api.TraeClient._post_authed` 会先用长效会话
+    ///   `X-Cloudide-Session` 调 GetUserToken 换一个**全新** JWT 再请求 ——
+    ///   存下来的那个 token 只是"上次换的票根"，根本不参与鉴权。
+    ///   实测：token 的 exp 已过 10 天，当天签到照样 HTTP 200 成功；
+    ///   界面却把它标红、挂上「重新登录」，而用户点完发现根本不用重登。
+    /// ⇒ **Trae 只看 session 在不在**，JWT 的 exp 不参与任何判定。
     func credentialHint() -> (text: String, color: ColorProxy)? {
         if isCredentialPlatform {
             guard let auth = cookieAuth else {
@@ -167,35 +181,24 @@ struct Account: Codable, Identifiable, Hashable {
                 : (text: "\(credentialNoun)未配置，请更新", color: .red)
         }
         guard isTrae else { return nil }
-        let token = trae_auth?.token ?? ""
-        let session = trae_auth?.session ?? ""
-        if token.isEmpty {
-            return (text: "Token 为空，请重新登录", color: .red)
+        // token 缺失**不**算坏：签到时会拿 session 现换一个（trae_login.py 也有这层兜底）
+        if (trae_auth?.session ?? "").isEmpty {
+            return (text: "缺少长效会话（X-Cloudide-Session），请重新登录 Trae", color: .red)
         }
-        if session.isEmpty {
-            return (text: "Session 缺失，请重新登录", color: .red)
-        }
-        guard let exp = Self.jwtExp(token) else { return (text: "凭证无法解析，请重新登录", color: .neutral) }
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
-        if exp < Date() {
-            return (text: "凭证已过期，请重新登录", color: .red)
-        }
-        return (text: "凭证 \(formatter.string(from: exp)) 前有效", color: .green)
+        return (text: "长效会话已配置", color: .green)
     }
 
-    static func jwtExp(_ jwt: String) -> Date? {
-        let parts = jwt.split(separator: ".")
-        guard parts.count >= 2 else { return nil }
-        var payload = String(parts[1])
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        let padLen = (4 - payload.count % 4) % 4
-        payload += String(repeating: "=", count: padLen)
-        guard let data = Data(base64Encoded: payload),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let exp = obj["exp"] as? Double else { return nil }
-        return Date(timeIntervalSince1970: exp)
+    /// 凭据保存至今的天数（读 saved_at，格式 "yyyy-MM-dd HH:mm:ss"）。
+    ///
+    /// 只用于**文案参考**（"已保存 11 天"），**绝不作失效判定**：
+    /// 会话到底还有多久由服务端说了算，"约 14 天"只是观测值，拿它算倒计时
+    /// 就会重演上面那段"没过期却报过期"的误报。
+    static func savedDays(_ savedAt: String?) -> Int? {
+        guard let s = savedAt, !s.isEmpty else { return nil }
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        guard let d = f.date(from: s) else { return nil }
+        return Calendar.current.dateComponents([.day], from: d, to: Date()).day
     }
 }
 
@@ -214,10 +217,13 @@ extension Account {
             return (workbuddy_auth?.source == "oauth") ? "OAuth 账号（昵称未回填）" : "本机登录态"
         }
         if isTrae {
-            let token = trae_auth?.token ?? ""
-            if token.isEmpty { return "Token 未配置" }
-            if let exp = Self.jwtExp(token), exp < Date() { return "Token 已过期" }
-            return "Token \(Self.mask(token))"
+            // 展示"长效会话"而不是那个 8 小时就过期的 JWT —— 真正决定能不能签到的是它。
+            // 天数只是参考信息，不写成"还剩 X 天"：那等于拿观测值当倒计时，会误报。
+            if (trae_auth?.session ?? "").isEmpty { return "缺少长效会话，请重新登录" }
+            if let d = Self.savedDays(trae_auth?.saved_at) {
+                return "长效会话 · 已保存 \(d) 天"
+            }
+            return "长效会话已配置"
         }
         return "Cookie 已配置"
     }
