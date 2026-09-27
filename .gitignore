@@ -26,6 +26,8 @@ native_prefs.json
 .workbuddy/preview/
 
 # ---- 构建产物 ----
+# 菜单栏图标的自查预览（make_menubar_icon.py 生成，打包只用 MenuBarIcon*.png）
+assets/menubar/preview-*.png
 # 内置浏览器运行时（playwright + 依赖，约 140MB）：由 setup_browser.sh 重建，不进版本库
 .venv/
 # SwiftPM 构建中间产物（.build 下含大量 .o）

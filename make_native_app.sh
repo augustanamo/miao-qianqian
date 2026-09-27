@@ -82,6 +82,11 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
   <true/>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
+  <!-- 常驻菜单栏的应用（agent）：启动即不占程序坞、不进 Cmd+Tab。
+       放在 Info.plist 里而不是只靠代码 setActivationPolicy(.accessory)，
+       是因为后者要到窗口 onAppear 才执行 —— 那之前 Dock 图标已经冒出来闪一下了。 -->
+  <key>LSUIElement</key>
+  <true/>
   <key>NSSupportsAutomaticTermination</key>
   <false/>
   <key>NSSupportsSuddenTermination</key>
@@ -118,6 +123,23 @@ if [ -d "$TOOL_DIR/assets/platform-icons" ]; then
   else
     echo "   提示：assets/platform-icons 下没有 PNG，平台头像将使用首字方块。"
   fi
+fi
+
+# 菜单栏图标 = 透明底黑猫（由 make_menubar_icon.py 从 AppIcon.icns 生成，
+# 白底与眼睛都挖成透明），App 侧以 isTemplate 渲染 —— 浅色菜单栏黑猫、深色白猫。
+# 找不到就现生成一次（需要 PIL）；再不行也不影响运行：代码会退回完整 App 图标。
+MB_DIR="$TOOL_DIR/assets/menubar"
+if [ ! -f "$MB_DIR/MenuBarIcon.png" ] && [ -f "$TOOL_DIR/make_menubar_icon.py" ]; then
+  CUR_PY="$(command -v python3 || true)"
+  if [ -n "$CUR_PY" ] && "$CUR_PY" -c "import PIL" >/dev/null 2>&1; then
+    "$CUR_PY" "$TOOL_DIR/make_menubar_icon.py" >/dev/null 2>&1 || true
+  fi
+fi
+if [ -f "$MB_DIR/MenuBarIcon.png" ]; then
+  cp "$MB_DIR"/MenuBarIcon.png "$MB_DIR"/MenuBarIcon@2x.png "$APP_DIR/Contents/Resources/"
+  echo "   已复制菜单栏图标（透明底黑猫，随菜单栏明暗自动反色）"
+else
+  echo "   提示：未生成菜单栏图标，顶部将退回完整 App 图标。"
 fi
 
 echo "==> 5/5 重做 ad-hoc 代码签名"

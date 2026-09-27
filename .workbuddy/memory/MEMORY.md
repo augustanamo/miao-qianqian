@@ -53,6 +53,11 @@
 - **状态信息只留一个真源**：开关只在顶栏胶囊+设置页；积分总额只在积分卡；连续签到只在总览卡；
   **「手动签到」只在顶栏**；账号页不要「签到状态摘要」卡。设置页**即时生效无保存按钮**。
 - 侧栏保留 `01~04` 序号；不要「导航」小标题/底部「本地账户」；「今日进度」卡固定侧栏底部。
+- **常驻形态**：App 是 `LSUIElement`（不占程序坞、不进 Cmd+Tab），回到窗口的唯一入口是
+  **菜单栏那只猫**（`NSStatusItem`）。菜单栏图标 = 应用图标黑猫，但**必须用专用资源**
+  `assets/menubar/MenuBarIcon*.png`（`make_menubar_icon.py` 从 AppIcon.icns 生成：白底与
+  眼睛挖成透明、按亮度取 alpha），以 `isTemplate=true` 随菜单栏明暗反色（浅色黑猫/深色白猫）。
+  **别直接贴整张 App 图标**：template 只认 alpha，白底与眼白会被涂成前景色 → 变成一块实心色块。
 - **非积分资源走独立字段**（阿里云盘容量是字节）。滚动图装不下时**不压窄柱子** → 横向滚动 + 锚最新 + 标签稀疏化。
 - SwiftUI 坑：`Menu` 标签忽略内部 `.frame()` → `Button`+`.popover`；`PlatformIcon.image()` 有 34pt 上限；
   `DatePicker(.field)` 要回车才写回 → 用「时/分」下拉；列表 identity 用带 UUID 的 struct；
